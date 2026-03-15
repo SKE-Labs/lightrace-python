@@ -95,9 +95,9 @@ class ToolClient:
                 ) as ws:
                     delay = 1.0  # reset on successful connect
                     await self._handle_connection(ws)
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001
                 if not self._running:
-                    break
+                    break  # type: ignore[unreachable]
                 logger.warning("Tool client connection error: %s (retry in %.0fs)", e, delay)
                 await asyncio.sleep(delay)
                 delay = min(delay * 2, self._max_reconnect_delay)

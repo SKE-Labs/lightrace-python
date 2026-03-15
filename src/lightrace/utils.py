@@ -34,7 +34,8 @@ def capture_args(func: Callable, args: tuple, kwargs: dict) -> dict[str, Any]:
     sig = inspect.signature(func)
     bound = sig.bind(*args, **kwargs)
     bound.apply_defaults()
-    return json_serializable(dict(bound.arguments))
+    result = json_serializable(dict(bound.arguments))
+    return result if isinstance(result, dict) else {}
 
 
 def build_json_schema(func: Callable) -> dict[str, Any] | None:
