@@ -270,7 +270,7 @@ requires-dist = [
     { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=0.24" },
     { name = "respx", marker = "extra == 'dev'", specifier = ">=0.22" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.15" },
-    { name = "websockets", specifier = ">=13,<15" },
+    { name = "websockets", specifier = ">=13,<17" },
 ]
 provides-extras = ["dev"]
 
