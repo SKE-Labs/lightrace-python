@@ -130,7 +130,8 @@ def _get_tracer() -> otel_trace.Tracer | None:
     """Get the OTel tracer from the exporter."""
     if _otel_exporter is None:
         return None
-    return _otel_exporter.tracer
+    tracer: otel_trace.Tracer = _otel_exporter.tracer
+    return tracer
 
 
 def _set_span_attributes(

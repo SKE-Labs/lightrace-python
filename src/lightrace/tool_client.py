@@ -239,16 +239,18 @@ class ToolClient:
         # Restore registered context variables from __lightrace_context
         context_data: dict = {}
         if isinstance(state_data, dict):
-            context_data = state_data.get("__lightrace_context", {})
-            if not isinstance(context_data, dict):
-                context_data = {}
+            raw = state_data.get("__lightrace_context", {})
+            if isinstance(raw, dict):
+                context_data = raw
 
         if context_data:
             restore_context(context_data)
 
         # Set invoke state in context variable for tool access
+        assert self._session_token is not None  # verified in _handle_invoke
+        session_token = self._session_token
         state_token = _invoke_state.set(state_data)
-        try:  # noqa: SIM105
+        try:
             if asyncio.iscoroutinefunction(func):
                 # Async tool: run with timeout
                 if isinstance(input_data, dict):
@@ -279,7 +281,7 @@ class ToolClient:
                 "nonce": nonce,
                 "output": output,
                 "durationMs": round(duration_ms),
-                "signature": sign(self._session_token, nonce, tool_name, output),
+                "signature": sign(session_token, nonce, tool_name, output),
             }
         except asyncio.TimeoutError:
             duration_ms = (time.monotonic() - start) * 1000
@@ -289,7 +291,7 @@ class ToolClient:
                 "output": None,
                 "error": f"Tool execution timed out after {timeout_seconds}s",
                 "durationMs": round(duration_ms),
-                "signature": sign(self._session_token, nonce, tool_name, None),
+                "signature": sign(session_token, nonce, tool_name, None),
             }
             logger.error("Tool execution timeout for %s", tool_name)
         except Exception as e:
@@ -300,7 +302,7 @@ class ToolClient:
                 "output": None,
                 "error": str(e),
                 "durationMs": round(duration_ms),
-                "signature": sign(self._session_token, nonce, tool_name, None),
+                "signature": sign(session_token, nonce, tool_name, None),
             }
             logger.error("Tool execution error for %s: %s", tool_name, e)
         finally:

@@ -66,11 +66,13 @@ class LightraceCallbackHandler(BaseCallbackHandler):
         if self._client is not None:
             exporter = getattr(self._client, "_otel_exporter", None)
             if exporter is not None:
-                return exporter.tracer
+                tracer: otel_trace.Tracer = exporter.tracer
+                return tracer
         # Fall back to global
         global_exporter = getattr(sys.modules.get("lightrace.trace", None), "_otel_exporter", None)
         if global_exporter is not None:
-            return global_exporter.tracer
+            tracer = global_exporter.tracer
+            return tracer
         return None
 
     def _get_parent_obs(self, parent_run_id: UUID | None) -> _ObsState | None:
