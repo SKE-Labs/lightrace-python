@@ -2,15 +2,21 @@
 
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
 
+from opentelemetry import trace as otel_trace
+
+from . import otel_exporter as attrs
 from .trace import _current_observation_id, _current_trace_id
-from .types import EVENT_TYPE_MAP, OBSERVATION_TYPE_MAP, TraceEvent
 from .utils import generate_id, json_serializable
 
 if TYPE_CHECKING:
-    from .exporter import BatchExporter
+    from .otel_exporter import LightraceOtelExporter
+
+
+from .otel_exporter import OBSERVATION_TYPE_UPPER
 
 
 class Observation:
@@ -25,7 +31,7 @@ class Observation:
         trace_id: str,
         type: str,
         name: str,
-        exporter: BatchExporter | None,
+        otel_exporter: LightraceOtelExporter | None,
         start_time: datetime | None = None,
         parent_id: str | None = None,
     ):
@@ -33,7 +39,7 @@ class Observation:
         self.trace_id = trace_id
         self.type = type
         self.name = name
-        self._exporter = exporter
+        self._otel_exporter = otel_exporter
         self.start_time = start_time or datetime.now(timezone.utc)
         self.parent_id = parent_id
 
@@ -71,58 +77,52 @@ class Observation:
             self._status_message = status_message
 
     def end(self) -> None:
-        """Emit the observation event to the exporter."""
+        """Emit the observation as an OTel span."""
         if self._ended:
             return
         self._ended = True
-
-        end_time = datetime.now(timezone.utc)
 
         # Restore context
         _current_trace_id.reset(self._trace_token)
         _current_observation_id.reset(self._obs_token)
 
-        if self._exporter is None:
+        if self._otel_exporter is None:
             return
 
-        create_type = EVENT_TYPE_MAP.get(self.type, ("span-create", "span-update"))[0]
+        tracer = self._otel_exporter.tracer
 
-        body: dict[str, Any] = {
-            "id": self.id,
-            "traceId": self.trace_id,
-            "type": (
-                OBSERVATION_TYPE_MAP[self.type].value
-                if self.type in OBSERVATION_TYPE_MAP
-                else self.type
-            ),
-            "name": self.name,
-            "startTime": self.start_time.isoformat() + "Z",
-            "endTime": end_time.isoformat() + "Z",
-            "input": self._input,
-            "output": self._output,
-            "metadata": self._metadata,
-            "model": self._model,
-            "level": self._level,
-            "statusMessage": self._status_message,
-            "parentObservationId": self.parent_id,
-        }
+        # Create a span for this observation
+        with tracer.start_as_current_span(self.name) as span:
+            obs_type_upper = OBSERVATION_TYPE_UPPER.get(self.type, "SPAN")
+            span.set_attribute(attrs.OBSERVATION_TYPE, obs_type_upper)
 
-        # Token / usage tracking
-        if self._usage:
-            if "prompt_tokens" in self._usage:
-                body["promptTokens"] = self._usage["prompt_tokens"]
-            if "completion_tokens" in self._usage:
-                body["completionTokens"] = self._usage["completion_tokens"]
-            if "total_tokens" in self._usage:
-                body["totalTokens"] = self._usage["total_tokens"]
+            if self._input is not None:
+                span.set_attribute(attrs.OBSERVATION_INPUT, attrs._safe_json(self._input))
+            if self._output is not None:
+                span.set_attribute(attrs.OBSERVATION_OUTPUT, attrs._safe_json(self._output))
+            if self._metadata:
+                span.set_attribute(attrs.OBSERVATION_METADATA, attrs._safe_json(self._metadata))
+            if self._model:
+                span.set_attribute(attrs.OBSERVATION_MODEL, self._model)
+            if self._level != "DEFAULT":
+                span.set_attribute(attrs.OBSERVATION_LEVEL, self._level)
+            if self._status_message:
+                span.set_attribute(attrs.OBSERVATION_STATUS_MESSAGE, self._status_message)
 
-        event = TraceEvent(
-            event_id=generate_id(),
-            event_type=create_type,
-            body=body,
-            timestamp=self.start_time,
-        )
-        self._exporter.enqueue(event)
+            # Usage for generations
+            if self._usage and self.type == "generation":
+                usage_details: dict[str, int] = {}
+                if "prompt_tokens" in self._usage:
+                    usage_details["input"] = self._usage["prompt_tokens"]
+                if "completion_tokens" in self._usage:
+                    usage_details["output"] = self._usage["completion_tokens"]
+                if "total_tokens" in self._usage:
+                    usage_details["total"] = self._usage["total_tokens"]
+                if usage_details:
+                    span.set_attribute(attrs.OBSERVATION_USAGE_DETAILS, json.dumps(usage_details))
+
+            if self._level == "ERROR":
+                span.set_status(otel_trace.StatusCode.ERROR, self._status_message or "Error")
 
     def span(self, name: str, **kwargs: Any) -> Observation:
         """Create a child span."""
@@ -131,7 +131,7 @@ class Observation:
             trace_id=self.trace_id,
             type="span",
             name=name,
-            exporter=self._exporter,
+            otel_exporter=self._otel_exporter,
             parent_id=self.id,
         )
         if "input" in kwargs:

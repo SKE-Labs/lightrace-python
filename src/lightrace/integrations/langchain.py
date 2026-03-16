@@ -1,7 +1,8 @@
-"""LangChain/LangGraph callback handler that sends traces to Lightrace."""
+"""LangChain/LangGraph callback handler that sends traces to Lightrace via OTel."""
 
 from __future__ import annotations
 
+import json
 import logging
 import sys
 from datetime import datetime, timezone
@@ -10,15 +11,18 @@ from uuid import UUID
 
 from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.outputs import LLMResult
+from opentelemetry import context as otel_context
+from opentelemetry import trace as otel_trace
 
-from lightrace.types import TraceEvent
+from lightrace import otel_exporter as attrs
+from lightrace.context import capture_context
 from lightrace.utils import generate_id, json_serializable
 
 logger = logging.getLogger("lightrace.integrations.langchain")
 
 
 class LightraceCallbackHandler(BaseCallbackHandler):
-    """LangChain callback handler that sends traces to Lightrace.
+    """LangChain callback handler that sends traces to Lightrace via OTel.
 
     Usage::
 
@@ -37,6 +41,7 @@ class LightraceCallbackHandler(BaseCallbackHandler):
         metadata: dict[str, Any] | None = None,
         tags: list[str] | None = None,
         client: Any = None,
+        configurable: dict[str, Any] | None = None,
     ) -> None:
         super().__init__()
         self._user_id = user_id
@@ -45,6 +50,7 @@ class LightraceCallbackHandler(BaseCallbackHandler):
         self._metadata = metadata
         self._tags = tags
         self._client = client
+        self._configurable = configurable
 
         # State tracking
         self._runs: dict[str, _ObsState] = {}
@@ -55,18 +61,17 @@ class LightraceCallbackHandler(BaseCallbackHandler):
 
     # ── helpers ──────────────────────────────────────────────────────
 
-    def _get_exporter(self) -> Any:
-        """Return the exporter from client or global."""
+    def _get_tracer(self) -> otel_trace.Tracer | None:
+        """Return the OTel tracer from client or global exporter."""
         if self._client is not None:
-            return self._client._exporter  # type: ignore[attr-defined]
-        return sys.modules["lightrace.trace"]._exporter  # type: ignore[attr-defined]
-
-    def _emit(self, event: TraceEvent) -> None:
-        exporter = self._get_exporter()
-        if exporter is None:
-            logger.warning("Lightrace not initialised — dropping event %s", event.type)
-            return
-        exporter.enqueue(event)
+            exporter = getattr(self._client, "_otel_exporter", None)
+            if exporter is not None:
+                return exporter.tracer
+        # Fall back to global
+        global_exporter = getattr(sys.modules.get("lightrace.trace", None), "_otel_exporter", None)
+        if global_exporter is not None:
+            return global_exporter.tracer
+        return None
 
     def _get_parent_obs(self, parent_run_id: UUID | None) -> _ObsState | None:
         if parent_run_id is None:
@@ -124,11 +129,9 @@ class LightraceCallbackHandler(BaseCallbackHandler):
         """Extract token usage from an LLMResult, supporting multiple providers."""
         usage: dict[str, Any] | None = None
 
-        # Try llm_output level first
         if response.llm_output and isinstance(response.llm_output, dict):
             usage = response.llm_output.get("token_usage") or response.llm_output.get("usage")
 
-        # Also check generation-level usage_metadata
         if not usage and response.generations:
             last_gen_list = response.generations[-1]
             last_gen = last_gen_list[-1] if last_gen_list else None
@@ -146,7 +149,6 @@ class LightraceCallbackHandler(BaseCallbackHandler):
         if not usage or not isinstance(usage, dict):
             return None
 
-        # Normalize keys from various providers
         result: dict[str, int] = {}
         prompt = (
             usage.get("prompt_tokens") or usage.get("input_tokens") or usage.get("promptTokens")
@@ -191,64 +193,57 @@ class LightraceCallbackHandler(BaseCallbackHandler):
         metadata: dict[str, Any] | None = None,
         model_parameters: dict[str, Any] | None = None,
     ) -> _ObsState:
-        """Create an observation state, emit the create event, and store it."""
+        """Create an observation by starting an OTel span."""
         rid = str(run_id)
         self._run_parents[rid] = str(parent_run_id) if parent_run_id else None
 
+        tracer = self._get_tracer()
         is_root = parent_run_id is None and self._root_run_id is None
-        now = datetime.now(timezone.utc)
 
-        # If this is the very first call (root), emit a trace-create event
+        # Determine parent OTel context
+        parent_ctx = otel_context.get_current()
+        if parent_run_id:
+            parent_obs = self._get_parent_obs(parent_run_id)
+            if parent_obs and parent_obs.otel_context:
+                parent_ctx = parent_obs.otel_context
+
+        # Start the OTel span
+        span: otel_trace.Span | None = None
+        span_context = parent_ctx
+        if tracer is not None:
+            span = tracer.start_span(name, context=parent_ctx)
+            span_context = otel_trace.set_span_in_context(span, parent_ctx)
+
+        trace_id: str
         if is_root:
-            trace_id = generate_id()
             self._root_run_id = rid
+            if span is not None:
+                trace_id = format(span.get_span_context().trace_id, "032x")
+            else:
+                trace_id = generate_id()
             self.last_trace_id = trace_id
 
-            trace_body: dict[str, Any] = {
-                "id": trace_id,
-                "name": self._trace_name or name,
-                "timestamp": now.isoformat() + "Z",
-            }
-            if self._user_id:
-                trace_body["userId"] = self._user_id
-            if self._session_id:
-                trace_body["sessionId"] = self._session_id
-            if self._metadata:
-                trace_body["metadata"] = self._metadata
-            if self._tags:
-                trace_body["tags"] = self._tags
-
-            self._emit(
-                TraceEvent(
-                    event_id=generate_id(),
-                    event_type="trace-create",
-                    body=trace_body,
-                    timestamp=now,
-                )
-            )
+            # Set root trace attributes
+            if span is not None:
+                span.set_attribute(attrs.AS_ROOT, "true")
+                span.set_attribute(attrs.TRACE_NAME, self._trace_name or name)
+                if input_data is not None:
+                    span.set_attribute(
+                        attrs.TRACE_INPUT, attrs._safe_json(json_serializable(input_data))
+                    )
+                if self._user_id:
+                    span.set_attribute(attrs.TRACE_USER_ID, self._user_id)
+                if self._session_id:
+                    span.set_attribute(attrs.TRACE_SESSION_ID, self._session_id)
+                if self._metadata:
+                    span.set_attribute(attrs.TRACE_METADATA, attrs._safe_json(self._metadata))
+                if self._tags:
+                    span.set_attribute(attrs.TRACE_TAGS, attrs._safe_json(self._tags))
         else:
-            # Inherit trace_id from parent or root
             parent_obs = self._get_parent_obs(parent_run_id)
             trace_id = parent_obs.trace_id if parent_obs else (self.last_trace_id or generate_id())
 
-        obs_id = generate_id()
-        parent_obs_id = (
-            self._runs[str(parent_run_id)].obs_id
-            if parent_run_id and str(parent_run_id) in self._runs
-            else None
-        )
-
-        # Map obs_type to event type
-        event_type_map = {
-            "span": "span-create",
-            "generation": "generation-create",
-            "tool": "tool-create",
-            "chain": "span-create",
-            "agent": "span-create",
-        }
-        create_type = event_type_map.get(obs_type, "span-create")
-
-        # Map obs_type to OBSERVATION type value
+        # Set observation attributes
         obs_type_value_map = {
             "span": "SPAN",
             "generation": "GENERATION",
@@ -258,45 +253,47 @@ class LightraceCallbackHandler(BaseCallbackHandler):
         }
         type_value = obs_type_value_map.get(obs_type, "SPAN")
 
-        merged_metadata = (
-            {**(self._metadata or {}), **(metadata or {})} if (self._metadata or metadata) else None
-        )
+        if span is not None and not is_root:
+            span.set_attribute(attrs.OBSERVATION_TYPE, type_value)
+            if input_data is not None:
+                span.set_attribute(
+                    attrs.OBSERVATION_INPUT, attrs._safe_json(json_serializable(input_data))
+                )
 
-        body: dict[str, Any] = {
-            "id": obs_id,
-            "traceId": trace_id,
-            "type": type_value,
-            "name": name,
-            "startTime": now.isoformat() + "Z",
-            "input": json_serializable(input_data),
-            "metadata": merged_metadata,
-            "model": model,
-            "level": "DEFAULT",
-            "statusMessage": None,
-            "parentObservationId": parent_obs_id,
-        }
-
-        if model_parameters:
-            body["modelParameters"] = model_parameters
-
-        self._emit(
-            TraceEvent(
-                event_id=generate_id(),
-                event_type=create_type,
-                body=body,
-                timestamp=now,
+            merged_metadata = (
+                {**(self._metadata or {}), **(metadata or {})}
+                if (self._metadata or metadata)
+                else None
             )
-        )
+
+            # Capture execution context for tool observations
+            if obs_type == "tool":
+                ctx = capture_context()
+                if self._configurable:
+                    ctx["__configurable"] = self._configurable
+                if ctx:
+                    merged_metadata = {**(merged_metadata or {}), "__lightrace_context": ctx}
+
+            if merged_metadata:
+                span.set_attribute(attrs.OBSERVATION_METADATA, attrs._safe_json(merged_metadata))
+            if model:
+                span.set_attribute(attrs.OBSERVATION_MODEL, model)
+            if model_parameters:
+                span.set_attribute(
+                    attrs.OBSERVATION_MODEL_PARAMETERS, attrs._safe_json(model_parameters)
+                )
 
         obs = _ObsState(
-            obs_id=obs_id,
+            obs_id=generate_id(),
             trace_id=trace_id,
             obs_type=obs_type,
             name=name,
-            start_time=now,
-            parent_obs_id=parent_obs_id,
+            start_time=datetime.now(timezone.utc),
+            parent_obs_id=None,
             model=model,
             model_parameters=model_parameters,
+            span=span,
+            otel_context=span_context,
         )
         self._runs[rid] = obs
         return obs
@@ -309,60 +306,50 @@ class LightraceCallbackHandler(BaseCallbackHandler):
         level: str = "DEFAULT",
         status_message: str | None = None,
     ) -> None:
-        """End an observation by emitting an update event."""
+        """End an observation by finishing the OTel span."""
         rid = str(run_id)
         obs = self._runs.get(rid)
         if obs is None:
             return
 
-        now = datetime.now(timezone.utc)
+        span = obs.span
+        if span is not None:
+            if output is not None:
+                if obs.obs_type in ("chain", "agent", "span", "tool") or (rid == self._root_run_id):
+                    attr_key = (
+                        attrs.TRACE_OUTPUT if rid == self._root_run_id else attrs.OBSERVATION_OUTPUT
+                    )
+                else:
+                    attr_key = attrs.OBSERVATION_OUTPUT
+                span.set_attribute(attr_key, attrs._safe_json(json_serializable(output)))
 
-        # Map obs_type to update event type
-        update_type_map = {
-            "span": "span-update",
-            "generation": "generation-update",
-            "tool": "tool-update",
-            "chain": "span-update",
-            "agent": "span-update",
-        }
-        update_type = update_type_map.get(obs.obs_type, "span-update")
+            if obs.model:
+                span.set_attribute(attrs.OBSERVATION_MODEL, obs.model)
 
-        body: dict[str, Any] = {
-            "id": obs.obs_id,
-            "traceId": obs.trace_id,
-            "endTime": now.isoformat() + "Z",
-            "output": json_serializable(output),
-            "level": level,
-            "statusMessage": status_message,
-        }
+            if usage:
+                usage_details: dict[str, int] = {}
+                if "prompt_tokens" in usage:
+                    usage_details["input"] = usage["prompt_tokens"]
+                if "completion_tokens" in usage:
+                    usage_details["output"] = usage["completion_tokens"]
+                if "total_tokens" in usage:
+                    usage_details["total"] = usage["total_tokens"]
+                if usage_details:
+                    span.set_attribute(attrs.OBSERVATION_USAGE_DETAILS, json.dumps(usage_details))
 
-        if obs.model:
-            body["model"] = obs.model
+            if rid in self._completion_start_times and obs.completion_start_time:
+                span.set_attribute(
+                    attrs.OBSERVATION_COMPLETION_START_TIME, obs.completion_start_time
+                )
+                self._completion_start_times.discard(rid)
 
-        if obs.model_parameters:
-            body["modelParameters"] = obs.model_parameters
+            if level == "ERROR":
+                span.set_attribute(attrs.OBSERVATION_LEVEL, "ERROR")
+                span.set_status(otel_trace.StatusCode.ERROR, status_message or "Error")
+                if status_message:
+                    span.set_attribute(attrs.OBSERVATION_STATUS_MESSAGE, status_message)
 
-        if usage:
-            if "prompt_tokens" in usage:
-                body["promptTokens"] = usage["prompt_tokens"]
-            if "completion_tokens" in usage:
-                body["completionTokens"] = usage["completion_tokens"]
-            if "total_tokens" in usage:
-                body["totalTokens"] = usage["total_tokens"]
-
-        # Record completion_start_time if tracked
-        if rid in self._completion_start_times:
-            body["completionStartTime"] = obs.completion_start_time
-            self._completion_start_times.discard(rid)
-
-        self._emit(
-            TraceEvent(
-                event_id=generate_id(),
-                event_type=update_type,
-                body=body,
-                timestamp=now,
-            )
-        )
+            span.end()
 
         # Clean up if this was the root run
         if rid == self._root_run_id:
@@ -391,7 +378,6 @@ class LightraceCallbackHandler(BaseCallbackHandler):
         try:
             serialized = serialized or {}
             inputs = self._normalize_io(inputs) if inputs is not None else None
-            # Determine if this is an agent
             class_path = serialized.get("id", [])
             name_str = name or serialized.get("name", "")
             full_path = ":".join(class_path) if isinstance(class_path, list) else str(class_path)
@@ -435,7 +421,6 @@ class LightraceCallbackHandler(BaseCallbackHandler):
         **kwargs: Any,
     ) -> None:
         try:
-            # LangGraph uses GraphBubbleUp for internal control flow — not a real error
             error_type = type(error).__name__
             if error_type == "GraphBubbleUp":
                 self._end_obs(run_id)
@@ -532,7 +517,6 @@ class LightraceCallbackHandler(BaseCallbackHandler):
         **kwargs: Any,
     ) -> None:
         try:
-            # Try to extract model name from response if not already set
             rid = str(run_id)
             obs = self._runs.get(rid)
             if obs is not None and not obs.model:
@@ -543,7 +527,6 @@ class LightraceCallbackHandler(BaseCallbackHandler):
                     if model:
                         obs.model = str(model)
 
-            # Extract output — handle ChatGeneration messages
             output: Any = None
             if response.generations and response.generations[-1]:
                 last_gen = response.generations[-1][-1]
@@ -557,7 +540,6 @@ class LightraceCallbackHandler(BaseCallbackHandler):
                         output_dict["tool_calls"] = msg.tool_calls
                     output = output_dict
                 else:
-                    # Fall back to collecting all text outputs
                     output_texts: list[str] = []
                     for gen_list in response.generations:
                         for gen in gen_list:
@@ -725,6 +707,8 @@ class _ObsState:
         "model",
         "model_parameters",
         "completion_start_time",
+        "span",
+        "otel_context",
     )
 
     def __init__(
@@ -737,6 +721,8 @@ class _ObsState:
         parent_obs_id: str | None,
         model: str | None,
         model_parameters: dict[str, Any] | None = None,
+        span: otel_trace.Span | None = None,
+        otel_context: Any = None,
     ) -> None:
         self.obs_id = obs_id
         self.trace_id = trace_id
@@ -747,3 +733,5 @@ class _ObsState:
         self.model = model
         self.model_parameters = model_parameters
         self.completion_start_time: str | None = None
+        self.span = span
+        self.otel_context = otel_context

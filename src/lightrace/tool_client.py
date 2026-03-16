@@ -8,13 +8,26 @@ import json
 import logging
 import threading
 import time
+from contextvars import ContextVar
 from typing import Any
 
+from .context import restore_context
 from .security import NonceTracker, sign, verify
 from .trace import _get_tool_registry
 from .utils import generate_id, json_serializable
 
 logger = logging.getLogger("lightrace")
+
+# Context variable for invoke state — tools can access via get_invoke_state()
+_invoke_state: ContextVar[Any] = ContextVar("lightrace_invoke_state", default=None)
+
+
+def get_invoke_state() -> Any:
+    """Get the state passed with the current tool invocation.
+
+    Returns None if not in an invocation context or no state was provided.
+    """
+    return _invoke_state.get()
 
 
 class ToolClient:
@@ -172,6 +185,7 @@ class ToolClient:
         nonce = msg.get("nonce", "")
         tool_name = msg.get("tool", "")
         input_data = msg.get("input")
+        state_data = msg.get("state")
         signature = msg.get("signature", "")
 
         # Verify HMAC
@@ -188,7 +202,7 @@ class ToolClient:
             await ws.send(json.dumps({"type": "error", "message": "Replayed nonce"}))
             return
 
-        # Find and execute tool
+        # Find tool
         registry = _get_tool_registry()
         tool_info = registry.get(tool_name)
         if not tool_info:
@@ -203,19 +217,61 @@ class ToolClient:
             await ws.send(json.dumps(result_msg))
             return
 
+        # Fire and forget — don't block the message handler
+        asyncio.create_task(
+            self._execute_invoke(ws, nonce, tool_name, tool_info, input_data, state_data)
+        )
+
+    async def _execute_invoke(
+        self,
+        ws: Any,
+        nonce: str,
+        tool_name: str,
+        tool_info: dict,
+        input_data: Any,
+        state_data: Any,
+    ) -> None:
+        """Execute a tool invocation in isolation (runs as a concurrent task)."""
         func = tool_info["func"]
         start = time.monotonic()
-        try:
+        timeout_seconds = 30.0
+
+        # Restore registered context variables from __lightrace_context
+        context_data: dict = {}
+        if isinstance(state_data, dict):
+            context_data = state_data.get("__lightrace_context", {})
+            if not isinstance(context_data, dict):
+                context_data = {}
+
+        if context_data:
+            restore_context(context_data)
+
+        # Set invoke state in context variable for tool access
+        state_token = _invoke_state.set(state_data)
+        try:  # noqa: SIM105
             if asyncio.iscoroutinefunction(func):
+                # Async tool: run with timeout
                 if isinstance(input_data, dict):
-                    output = await func(**input_data)
+                    output = await asyncio.wait_for(func(**input_data), timeout=timeout_seconds)
                 else:
-                    output = await func(input_data) if input_data is not None else await func()
+                    coro = func(input_data) if input_data is not None else func()
+                    output = await asyncio.wait_for(coro, timeout=timeout_seconds)
             else:
+                # Sync tool: run in thread pool for isolation
                 if isinstance(input_data, dict):
-                    output = func(**input_data)
+                    output = await asyncio.wait_for(
+                        asyncio.to_thread(func, **input_data), timeout=timeout_seconds
+                    )
                 else:
-                    output = func(input_data) if input_data is not None else func()
+                    if input_data is not None:
+                        output = await asyncio.wait_for(
+                            asyncio.to_thread(func, input_data), timeout=timeout_seconds
+                        )
+                    else:
+                        output = await asyncio.wait_for(
+                            asyncio.to_thread(func), timeout=timeout_seconds
+                        )
+
             duration_ms = (time.monotonic() - start) * 1000
             output = json_serializable(output)
             result_msg = {
@@ -225,6 +281,17 @@ class ToolClient:
                 "durationMs": round(duration_ms),
                 "signature": sign(self._session_token, nonce, tool_name, output),
             }
+        except asyncio.TimeoutError:
+            duration_ms = (time.monotonic() - start) * 1000
+            result_msg = {
+                "type": "result",
+                "nonce": nonce,
+                "output": None,
+                "error": f"Tool execution timed out after {timeout_seconds}s",
+                "durationMs": round(duration_ms),
+                "signature": sign(self._session_token, nonce, tool_name, None),
+            }
+            logger.error("Tool execution timeout for %s", tool_name)
         except Exception as e:
             duration_ms = (time.monotonic() - start) * 1000
             result_msg = {
@@ -236,5 +303,7 @@ class ToolClient:
                 "signature": sign(self._session_token, nonce, tool_name, None),
             }
             logger.error("Tool execution error for %s: %s", tool_name, e)
+        finally:
+            _invoke_state.reset(state_token)
 
         await ws.send(json.dumps(result_msg))
