@@ -43,6 +43,9 @@ def trace(
     invoke: bool = True,
     model: str | None = None,
     metadata: dict[str, Any] | None = None,
+    user_id: str | None = None,
+    session_id: str | None = None,
+    usage: dict[str, int] | None = None,
 ) -> Callable[[F], F]:
     """Unified decorator for tracing functions.
 
@@ -52,6 +55,9 @@ def trace(
         invoke: For type="tool" only. If True (default), register for remote invocation.
         model: For type="generation" only. LLM model name.
         metadata: Static metadata attached to every call.
+        user_id: User ID for root traces (overrides client default).
+        session_id: Session ID for root traces (overrides client default).
+        usage: Token usage dict for generations (prompt_tokens, completion_tokens, total_tokens).
     """
     if type is not None and type not in EVENT_TYPE_MAP:
         raise ValueError(
@@ -73,7 +79,17 @@ def trace(
             @functools.wraps(func)
             async def async_wrapper(*args: Any, **kwargs: Any) -> Any:
                 return await _execute(
-                    func, obs_name, type, model, metadata, args, kwargs, is_async=True
+                    func,
+                    obs_name,
+                    type,
+                    model,
+                    metadata,
+                    args,
+                    kwargs,
+                    is_async=True,
+                    user_id=user_id,
+                    session_id=session_id,
+                    usage=usage,
                 )
 
             return async_wrapper  # type: ignore
@@ -81,7 +97,18 @@ def trace(
 
             @functools.wraps(func)
             def sync_wrapper(*args: Any, **kwargs: Any) -> Any:
-                return _execute_sync(func, obs_name, type, model, metadata, args, kwargs)
+                return _execute_sync(
+                    func,
+                    obs_name,
+                    type,
+                    model,
+                    metadata,
+                    args,
+                    kwargs,
+                    user_id=user_id,
+                    session_id=session_id,
+                    usage=usage,
+                )
 
             return sync_wrapper  # type: ignore
 
@@ -96,6 +123,9 @@ def _execute_sync(
     static_metadata: dict[str, Any] | None,
     args: tuple,
     kwargs: dict,
+    user_id: str | None = None,
+    session_id: str | None = None,
+    usage: dict[str, int] | None = None,
 ) -> Any:
     """Execute a sync function with tracing."""
     is_root = obs_type is None
@@ -132,6 +162,9 @@ def _execute_sync(
             metadata=static_metadata,
             parent_observation_id=parent_obs_id if not is_root else None,
             level="DEFAULT",
+            user_id=user_id,
+            session_id=session_id,
+            usage=usage,
         )
         return result
     except Exception as e:
@@ -150,6 +183,9 @@ def _execute_sync(
             parent_observation_id=parent_obs_id if not is_root else None,
             level="ERROR",
             status_message=str(e),
+            user_id=user_id,
+            session_id=session_id,
+            usage=usage,
         )
         raise
     finally:
@@ -166,6 +202,9 @@ async def _execute(
     args: tuple,
     kwargs: dict,
     is_async: bool = False,
+    user_id: str | None = None,
+    session_id: str | None = None,
+    usage: dict[str, int] | None = None,
 ) -> Any:
     """Execute an async function with tracing."""
     is_root = obs_type is None
@@ -200,6 +239,9 @@ async def _execute(
             metadata=static_metadata,
             parent_observation_id=parent_obs_id if not is_root else None,
             level="DEFAULT",
+            user_id=user_id,
+            session_id=session_id,
+            usage=usage,
         )
         return result
     except Exception as e:
@@ -218,6 +260,9 @@ async def _execute(
             parent_observation_id=parent_obs_id if not is_root else None,
             level="ERROR",
             status_message=str(e),
+            user_id=user_id,
+            session_id=session_id,
+            usage=usage,
         )
         raise
     finally:
@@ -239,6 +284,9 @@ def _emit_event(
     parent_observation_id: str | None,
     level: str = "DEFAULT",
     status_message: str | None = None,
+    user_id: str | None = None,
+    session_id: str | None = None,
+    usage: dict[str, int] | None = None,
 ) -> None:
     """Create and enqueue a trace event."""
     if _exporter is None:
@@ -249,6 +297,13 @@ def _emit_event(
     create_type = EVENT_TYPE_MAP.get(obs_type, ("trace-create", "trace-create"))[0]
     event_id = generate_id()
 
+    # Resolve user_id / session_id from decorator or client defaults
+    from .client import Lightrace
+
+    client = Lightrace.get_instance()
+    effective_user_id = user_id or (client.user_id if client else None)
+    effective_session_id = session_id or (client.session_id if client else None)
+
     if is_root:
         body: dict[str, Any] = {
             "id": entity_id,
@@ -258,6 +313,10 @@ def _emit_event(
             "output": output_data,
             "metadata": metadata,
         }
+        if effective_user_id:
+            body["userId"] = effective_user_id
+        if effective_session_id:
+            body["sessionId"] = effective_session_id
     else:
         body = {
             "id": entity_id,
@@ -278,6 +337,14 @@ def _emit_event(
             "statusMessage": status_message,
             "parentObservationId": parent_observation_id,
         }
+        # Token / usage tracking for generations
+        if usage:
+            if "prompt_tokens" in usage:
+                body["promptTokens"] = usage["prompt_tokens"]
+            if "completion_tokens" in usage:
+                body["completionTokens"] = usage["completion_tokens"]
+            if "total_tokens" in usage:
+                body["totalTokens"] = usage["total_tokens"]
 
     event = TraceEvent(
         event_id=event_id,

@@ -34,7 +34,7 @@ def search(query: str) -> list:
 def generate(prompt: str) -> str:
     return "LLM response"
 
-# Tool — remotely invocable from the LightRace UI
+# Tool — remotely invocable from the Lightrace UI
 @trace(type="tool")
 def weather_lookup(city: str) -> dict:
     return {"temp": 72, "unit": "F"}
@@ -71,7 +71,7 @@ lt.shutdown()
 
 ## Compatibility
 
-LightRace server also accepts traces from Langfuse Python/JS SDKs.
+Lightrace server also accepts traces from Langfuse Python/JS SDKs.
 
 ## Development
 

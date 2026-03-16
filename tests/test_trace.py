@@ -1,6 +1,6 @@
 """Tests for the unified @trace decorator."""
 
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -159,6 +159,75 @@ class TestTraceDecorator:
             def func():
                 pass
 
+    def test_session_and_user_on_root_trace(self, _setup_exporter):
+        mock = _setup_exporter
+
+        @trace(user_id="user-42", session_id="sess-99")
+        def my_func(x: int) -> int:
+            return x
+
+        my_func(1)
+        event = mock.enqueued[0]
+        assert event.type == "trace-create"
+        assert event.body["userId"] == "user-42"
+        assert event.body["sessionId"] == "sess-99"
+
+    def test_session_and_user_from_client_defaults(self, _setup_exporter):
+        mock = _setup_exporter
+
+        # Patch Lightrace.get_instance to return a mock client with defaults
+        mock_client = MagicMock()
+        mock_client.user_id = "default-user"
+        mock_client.session_id = "default-session"
+
+        with patch("lightrace.client.Lightrace.get_instance", return_value=mock_client):
+
+            @trace()
+            def my_func() -> str:
+                return "ok"
+
+            my_func()
+            event = mock.enqueued[0]
+            assert event.body["userId"] == "default-user"
+            assert event.body["sessionId"] == "default-session"
+
+    def test_decorator_user_overrides_client_default(self, _setup_exporter):
+        mock = _setup_exporter
+
+        mock_client = MagicMock()
+        mock_client.user_id = "default-user"
+        mock_client.session_id = "default-session"
+
+        with patch("lightrace.client.Lightrace.get_instance", return_value=mock_client):
+
+            @trace(user_id="override-user")
+            def my_func() -> str:
+                return "ok"
+
+            my_func()
+            event = mock.enqueued[0]
+            assert event.body["userId"] == "override-user"
+            # session_id should still come from client default
+            assert event.body["sessionId"] == "default-session"
+
+    def test_generation_usage_tracking(self, _setup_exporter):
+        mock = _setup_exporter
+
+        @trace(
+            type="generation",
+            model="gpt-4o",
+            usage={"prompt_tokens": 10, "completion_tokens": 50, "total_tokens": 60},
+        )
+        def gen(prompt: str) -> str:
+            return "answer"
+
+        gen("question")
+        event = mock.enqueued[0]
+        assert event.type == "generation-create"
+        assert event.body["promptTokens"] == 10
+        assert event.body["completionTokens"] == 50
+        assert event.body["totalTokens"] == 60
+
 
 class TestTraceDecoratorAsync:
     @pytest.mark.asyncio
@@ -187,3 +256,34 @@ class TestTraceDecoratorAsync:
 
         registry = _get_tool_registry()
         assert "async_weather" in registry
+
+    @pytest.mark.asyncio
+    async def test_async_session_user(self, _setup_exporter):
+        mock = _setup_exporter
+
+        @trace(user_id="async-user", session_id="async-sess")
+        async def my_async() -> str:
+            return "ok"
+
+        await my_async()
+        event = mock.enqueued[0]
+        assert event.body["userId"] == "async-user"
+        assert event.body["sessionId"] == "async-sess"
+
+    @pytest.mark.asyncio
+    async def test_async_generation_usage(self, _setup_exporter):
+        mock = _setup_exporter
+
+        @trace(
+            type="generation",
+            model="gpt-4o",
+            usage={"prompt_tokens": 5, "completion_tokens": 20, "total_tokens": 25},
+        )
+        async def gen(prompt: str) -> str:
+            return "result"
+
+        await gen("hi")
+        event = mock.enqueued[0]
+        assert event.body["promptTokens"] == 5
+        assert event.body["completionTokens"] == 20
+        assert event.body["totalTokens"] == 25

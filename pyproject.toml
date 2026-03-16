@@ -9,7 +9,7 @@ description = "Lightweight LLM tracing SDK with remote tool invocation"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.10"
-authors = [{ name = "LightRace Contributors" }]
+authors = [{ name = "Lightrace Contributors" }]
 keywords = ["llm", "tracing", "observability", "langfuse", "opentelemetry", "tool-invocation"]
 classifiers = [
     "Development Status :: 3 - Alpha",
@@ -29,10 +29,11 @@ dependencies = [
 ]
 
 [project.urls]
-Repository = "https://github.com/nichochar/lightrace-python"
-Changelog = "https://github.com/nichochar/lightrace-python/blob/main/CHANGELOG.md"
+Repository = "https://github.com/SKE-Labs/lightrace-python"
+Changelog = "https://github.com/SKE-Labs/lightrace-python/blob/main/CHANGELOG.md"
 
 [project.optional-dependencies]
+langchain = ["langchain-core>=0.2"]
 dev = [
     "pytest>=8",
     "pytest-asyncio>=0.24",
@@ -76,4 +77,8 @@ show_column_numbers = true
 
 [[tool.mypy.overrides]]
 module = ["websockets.*"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = ["langchain_core.*"]
 ignore_missing_imports = true

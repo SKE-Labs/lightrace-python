@@ -12,7 +12,7 @@ Thank you for your interest in contributing!
 ### Quick Start
 
 ```bash
-git clone https://github.com/nichochar/lightrace-python.git
+git clone https://github.com/SKE-Labs/lightrace-python.git
 cd lightrace-python
 uv sync --extra dev
 uv run pre-commit install
