@@ -9,7 +9,8 @@ import pytest
 
 try:
     from langchain_core.callbacks import BaseCallbackHandler  # noqa: F401
-    from langchain_core.outputs import Generation, LLMResult
+    from langchain_core.messages import AIMessage
+    from langchain_core.outputs import ChatGeneration, Generation, LLMResult
 except ImportError:
     pytest.skip("langchain-core not installed", allow_module_level=True)
 
@@ -36,6 +37,32 @@ def mock_exporter():
 
 def _make_handler(**kwargs):
     return LightraceCallbackHandler(**kwargs)
+
+
+# ── Helper fakes ─────────────────────────────────────────────────────
+
+
+class FakeMessage:
+    def __init__(
+        self,
+        role: str,
+        content: str,
+        tool_calls: list | None = None,
+        usage_metadata: dict | None = None,
+    ):
+        self.type = role
+        self.content = content
+        self.tool_calls = tool_calls or []
+        self.usage_metadata = usage_metadata
+
+
+class FakeChatGeneration:
+    """Mimics ChatGeneration with a .message attribute."""
+
+    def __init__(self, text: str, message: FakeMessage | None = None):
+        self.text = text
+        self.message = message
+        self.generation_info: dict | None = None
 
 
 # ── Basic chain tests ────────────────────────────────────────────────
@@ -135,6 +162,84 @@ class TestChainCallbacks:
         assert end_evt.body["level"] == "DEFAULT"
         assert end_evt.body.get("statusMessage") is None
 
+    def test_none_serialized_and_inputs(self, mock_exporter):
+        """LangGraph passes None for serialized and inputs — should not crash."""
+        handler = _make_handler()
+        run_id = uuid4()
+
+        handler.on_chain_start(
+            serialized=None,
+            inputs=None,
+            run_id=run_id,
+            parent_run_id=None,
+        )
+
+        assert len(mock_exporter.enqueued) == 2
+        chain_evt = mock_exporter.enqueued[1]
+        assert chain_evt.body["name"] == "chain"  # fallback name
+        assert chain_evt.body["input"] is None
+
+        handler.on_chain_end(
+            outputs=None,
+            run_id=run_id,
+            parent_run_id=None,
+        )
+
+        end_evt = mock_exporter.enqueued[-1]
+        assert end_evt.body["output"] is None
+
+    def test_name_override_from_kwargs(self, mock_exporter):
+        """name kwarg should override serialized name."""
+        handler = _make_handler()
+        run_id = uuid4()
+
+        handler.on_chain_start(
+            serialized={"id": ["langchain", "Chain"], "name": "Chain"},
+            inputs={},
+            run_id=run_id,
+            parent_run_id=None,
+            name="OverriddenName",
+        )
+
+        chain_evt = mock_exporter.enqueued[1]
+        assert chain_evt.body["name"] == "OverriddenName"
+
+    def test_basemessage_input_normalization(self, mock_exporter):
+        """BaseMessage objects in inputs should be converted to dicts."""
+        handler = _make_handler()
+        run_id = uuid4()
+
+        handler.on_chain_start(
+            serialized={"id": ["langchain", "Chain"], "name": "Chain"},
+            inputs={"messages": [FakeMessage("human", "Hello")]},
+            run_id=run_id,
+            parent_run_id=None,
+        )
+
+        chain_evt = mock_exporter.enqueued[1]
+        assert chain_evt.body["input"] == {"messages": [{"role": "human", "content": "Hello"}]}
+
+    def test_basemessage_output_normalization(self, mock_exporter):
+        """BaseMessage objects in outputs should be converted to dicts."""
+        handler = _make_handler()
+        run_id = uuid4()
+
+        handler.on_chain_start(
+            serialized={"id": ["langchain", "Chain"], "name": "Chain"},
+            inputs={},
+            run_id=run_id,
+            parent_run_id=None,
+        )
+
+        handler.on_chain_end(
+            outputs={"result": FakeMessage("ai", "Hello back")},
+            run_id=run_id,
+            parent_run_id=None,
+        )
+
+        end_evt = mock_exporter.enqueued[-1]
+        assert end_evt.body["output"] == {"result": {"role": "ai", "content": "Hello back"}}
+
 
 # ── LLM tests ────────────────────────────────────────────────────────
 
@@ -201,12 +306,6 @@ class TestLLMCallbacks:
             run_id=chain_id,
             parent_run_id=None,
         )
-
-        # Simulate chat message objects
-        class FakeMessage:
-            def __init__(self, role: str, content: str):
-                self.type = role
-                self.content = content
 
         messages = [[FakeMessage("human", "Hello"), FakeMessage("ai", "Hi there")]]
 
@@ -310,6 +409,345 @@ class TestLLMCallbacks:
         end_evt = mock_exporter.enqueued[-1]
         assert "completionStartTime" in end_evt.body
 
+    def test_name_override_from_kwargs_on_llm(self, mock_exporter):
+        """name kwarg should override serialized name for LLM start."""
+        handler = _make_handler()
+        chain_id = uuid4()
+        llm_id = uuid4()
+
+        handler.on_chain_start(
+            serialized={"id": ["langchain", "Chain"], "name": "Chain"},
+            inputs={},
+            run_id=chain_id,
+            parent_run_id=None,
+        )
+
+        handler.on_llm_start(
+            serialized={"id": ["langchain", "LLM"], "name": "LLM", "kwargs": {}},
+            prompts=["test"],
+            run_id=llm_id,
+            parent_run_id=chain_id,
+            name="MyCustomLLM",
+        )
+
+        gen_evt = mock_exporter.enqueued[-1]
+        assert gen_evt.body["name"] == "MyCustomLLM"
+
+    def test_name_override_from_kwargs_on_chat_model(self, mock_exporter):
+        """name kwarg should override serialized name for chat model start."""
+        handler = _make_handler()
+        chain_id = uuid4()
+        llm_id = uuid4()
+
+        handler.on_chain_start(
+            serialized={"id": ["langchain", "Chain"], "name": "Chain"},
+            inputs={},
+            run_id=chain_id,
+            parent_run_id=None,
+        )
+
+        handler.on_chat_model_start(
+            serialized={"id": ["langchain", "ChatOpenAI"], "name": "ChatOpenAI", "kwargs": {}},
+            messages=[[FakeMessage("human", "hi")]],
+            run_id=llm_id,
+            parent_run_id=chain_id,
+            name="CustomChatModel",
+        )
+
+        gen_evt = mock_exporter.enqueued[-1]
+        assert gen_evt.body["name"] == "CustomChatModel"
+
+
+# ── Multi-provider usage tests ────────────────────────────────────────
+
+
+class TestMultiProviderUsage:
+    def test_anthropic_usage_format(self, mock_exporter):
+        """Anthropic uses input_tokens/output_tokens."""
+        handler = _make_handler()
+        chain_id = uuid4()
+        llm_id = uuid4()
+
+        handler.on_chain_start(
+            serialized={"id": ["langchain", "Chain"], "name": "Chain"},
+            inputs={},
+            run_id=chain_id,
+            parent_run_id=None,
+        )
+        handler.on_llm_start(
+            serialized={"id": ["langchain", "LLM"], "name": "LLM", "kwargs": {}},
+            prompts=["test"],
+            run_id=llm_id,
+            parent_run_id=chain_id,
+        )
+
+        response = LLMResult(
+            generations=[[Generation(text="ok")]],
+            llm_output={
+                "usage": {
+                    "input_tokens": 15,
+                    "output_tokens": 25,
+                }
+            },
+        )
+        handler.on_llm_end(response=response, run_id=llm_id, parent_run_id=chain_id)
+
+        end_evt = mock_exporter.enqueued[-1]
+        assert end_evt.body["promptTokens"] == 15
+        assert end_evt.body["completionTokens"] == 25
+
+    def test_usage_from_generation_level_message(self, mock_exporter):
+        """Usage from message.usage_metadata on ChatGeneration."""
+        handler = _make_handler()
+        chain_id = uuid4()
+        llm_id = uuid4()
+
+        handler.on_chain_start(
+            serialized={"id": ["langchain", "Chain"], "name": "Chain"},
+            inputs={},
+            run_id=chain_id,
+            parent_run_id=None,
+        )
+        handler.on_llm_start(
+            serialized={"id": ["langchain", "LLM"], "name": "LLM", "kwargs": {}},
+            prompts=["test"],
+            run_id=llm_id,
+            parent_run_id=chain_id,
+        )
+
+        ai_msg = AIMessage(content="ok")
+        ai_msg.usage_metadata = {"input_tokens": 8, "output_tokens": 12}  # type: ignore[assignment]
+        gen = ChatGeneration(text="ok", message=ai_msg)
+        response = LLMResult(generations=[[gen]])
+        handler.on_llm_end(response=response, run_id=llm_id, parent_run_id=chain_id)
+
+        end_evt = mock_exporter.enqueued[-1]
+        assert end_evt.body["promptTokens"] == 8
+        assert end_evt.body["completionTokens"] == 12
+
+
+# ── Model parameter extraction tests ─────────────────────────────────
+
+
+class TestModelParameterExtraction:
+    def test_model_params_from_invocation_params(self, mock_exporter):
+        handler = _make_handler()
+        chain_id = uuid4()
+        llm_id = uuid4()
+
+        handler.on_chain_start(
+            serialized={"id": ["langchain", "Chain"], "name": "Chain"},
+            inputs={},
+            run_id=chain_id,
+            parent_run_id=None,
+        )
+
+        handler.on_llm_start(
+            serialized={"id": ["langchain", "LLM"], "name": "LLM", "kwargs": {}},
+            prompts=["test"],
+            run_id=llm_id,
+            parent_run_id=chain_id,
+            invocation_params={
+                "model_name": "gpt-4o",
+                "temperature": 0.7,
+                "max_tokens": 1024,
+                "top_p": 0.9,
+            },
+        )
+
+        gen_evt = mock_exporter.enqueued[-1]
+        assert gen_evt.body["modelParameters"] == {
+            "temperature": 0.7,
+            "max_tokens": 1024,
+            "top_p": 0.9,
+        }
+
+    def test_model_params_emitted_in_update(self, mock_exporter):
+        handler = _make_handler()
+        chain_id = uuid4()
+        llm_id = uuid4()
+
+        handler.on_chain_start(
+            serialized={"id": ["langchain", "Chain"], "name": "Chain"},
+            inputs={},
+            run_id=chain_id,
+            parent_run_id=None,
+        )
+
+        handler.on_llm_start(
+            serialized={"id": ["langchain", "LLM"], "name": "LLM", "kwargs": {}},
+            prompts=["test"],
+            run_id=llm_id,
+            parent_run_id=chain_id,
+            invocation_params={"temperature": 0.5},
+        )
+
+        response = LLMResult(generations=[[Generation(text="ok")]])
+        handler.on_llm_end(response=response, run_id=llm_id, parent_run_id=chain_id)
+
+        end_evt = mock_exporter.enqueued[-1]
+        assert end_evt.body["modelParameters"] == {"temperature": 0.5}
+
+    def test_no_model_params_when_empty(self, mock_exporter):
+        handler = _make_handler()
+        chain_id = uuid4()
+        llm_id = uuid4()
+
+        handler.on_chain_start(
+            serialized={"id": ["langchain", "Chain"], "name": "Chain"},
+            inputs={},
+            run_id=chain_id,
+            parent_run_id=None,
+        )
+
+        handler.on_llm_start(
+            serialized={"id": ["langchain", "LLM"], "name": "LLM", "kwargs": {}},
+            prompts=["test"],
+            run_id=llm_id,
+            parent_run_id=chain_id,
+        )
+
+        gen_evt = mock_exporter.enqueued[-1]
+        assert "modelParameters" not in gen_evt.body
+
+    def test_model_params_on_chat_model(self, mock_exporter):
+        handler = _make_handler()
+        chain_id = uuid4()
+        llm_id = uuid4()
+
+        handler.on_chain_start(
+            serialized={"id": ["langchain", "Chain"], "name": "Chain"},
+            inputs={},
+            run_id=chain_id,
+            parent_run_id=None,
+        )
+
+        handler.on_chat_model_start(
+            serialized={"id": ["langchain", "ChatOpenAI"], "name": "ChatOpenAI", "kwargs": {}},
+            messages=[[FakeMessage("human", "hi")]],
+            run_id=llm_id,
+            parent_run_id=chain_id,
+            invocation_params={"temperature": 0.0, "max_tokens": 512},
+        )
+
+        gen_evt = mock_exporter.enqueued[-1]
+        assert gen_evt.body["modelParameters"] == {"temperature": 0.0, "max_tokens": 512}
+
+
+# ── ChatGeneration message handling tests ─────────────────────────────
+
+
+class TestChatGenerationHandling:
+    def test_chat_generation_with_message(self, mock_exporter):
+        """ChatGeneration with .message should produce structured output."""
+        handler = _make_handler()
+        chain_id = uuid4()
+        llm_id = uuid4()
+
+        handler.on_chain_start(
+            serialized={"id": ["langchain", "Chain"], "name": "Chain"},
+            inputs={},
+            run_id=chain_id,
+            parent_run_id=None,
+        )
+        handler.on_llm_start(
+            serialized={"id": ["langchain", "LLM"], "name": "LLM", "kwargs": {}},
+            prompts=["test"],
+            run_id=llm_id,
+            parent_run_id=chain_id,
+        )
+
+        ai_msg = AIMessage(content="Hello there!")
+        gen = ChatGeneration(text="Hello there!", message=ai_msg)
+        response = LLMResult(generations=[[gen]])
+        handler.on_llm_end(response=response, run_id=llm_id, parent_run_id=chain_id)
+
+        end_evt = mock_exporter.enqueued[-1]
+        assert end_evt.body["output"] == {"role": "ai", "content": "Hello there!"}
+
+    def test_chat_generation_with_tool_calls(self, mock_exporter):
+        """ChatGeneration with tool_calls should include them in output."""
+        handler = _make_handler()
+        chain_id = uuid4()
+        llm_id = uuid4()
+
+        handler.on_chain_start(
+            serialized={"id": ["langchain", "Chain"], "name": "Chain"},
+            inputs={},
+            run_id=chain_id,
+            parent_run_id=None,
+        )
+        handler.on_llm_start(
+            serialized={"id": ["langchain", "LLM"], "name": "LLM", "kwargs": {}},
+            prompts=["test"],
+            run_id=llm_id,
+            parent_run_id=chain_id,
+        )
+
+        tool_calls = [
+            {"name": "search", "args": {"query": "weather"}, "id": "tc_1", "type": "tool_call"}
+        ]
+        ai_msg = AIMessage(content="", tool_calls=tool_calls)
+        gen = ChatGeneration(text="", message=ai_msg)
+        response = LLMResult(generations=[[gen]])
+        handler.on_llm_end(response=response, run_id=llm_id, parent_run_id=chain_id)
+
+        end_evt = mock_exporter.enqueued[-1]
+        assert end_evt.body["output"]["tool_calls"] == tool_calls
+
+    def test_plain_generation_fallback(self, mock_exporter):
+        """Regular Generation without message should fall back to text."""
+        handler = _make_handler()
+        chain_id = uuid4()
+        llm_id = uuid4()
+
+        handler.on_chain_start(
+            serialized={"id": ["langchain", "Chain"], "name": "Chain"},
+            inputs={},
+            run_id=chain_id,
+            parent_run_id=None,
+        )
+        handler.on_llm_start(
+            serialized={"id": ["langchain", "LLM"], "name": "LLM", "kwargs": {}},
+            prompts=["test"],
+            run_id=llm_id,
+            parent_run_id=chain_id,
+        )
+
+        response = LLMResult(generations=[[Generation(text="plain text")]])
+        handler.on_llm_end(response=response, run_id=llm_id, parent_run_id=chain_id)
+
+        end_evt = mock_exporter.enqueued[-1]
+        assert end_evt.body["output"] == "plain text"
+
+    def test_model_name_from_response(self, mock_exporter):
+        """Model name should be extracted from llm_output when not in serialized."""
+        handler = _make_handler()
+        chain_id = uuid4()
+        llm_id = uuid4()
+
+        handler.on_chain_start(
+            serialized={"id": ["langchain", "Chain"], "name": "Chain"},
+            inputs={},
+            run_id=chain_id,
+            parent_run_id=None,
+        )
+        handler.on_llm_start(
+            serialized={"id": ["langchain", "LLM"], "name": "LLM", "kwargs": {}},
+            prompts=["test"],
+            run_id=llm_id,
+            parent_run_id=chain_id,
+        )
+
+        response = LLMResult(
+            generations=[[Generation(text="ok")]],
+            llm_output={"model_name": "gpt-4o-2024-05-13"},
+        )
+        handler.on_llm_end(response=response, run_id=llm_id, parent_run_id=chain_id)
+
+        end_evt = mock_exporter.enqueued[-1]
+        assert end_evt.body["model"] == "gpt-4o-2024-05-13"
+
 
 # ── Tool tests ───────────────────────────────────────────────────────
 
@@ -377,6 +815,51 @@ class TestToolCallbacks:
         assert end_evt.body["level"] == "ERROR"
         assert end_evt.body["statusMessage"] == "tool failed"
 
+    def test_tool_name_override_from_kwargs(self, mock_exporter):
+        handler = _make_handler()
+        chain_id = uuid4()
+        tool_id = uuid4()
+
+        handler.on_chain_start(
+            serialized={"id": ["langchain", "Chain"], "name": "Chain"},
+            inputs={},
+            run_id=chain_id,
+            parent_run_id=None,
+        )
+
+        handler.on_tool_start(
+            serialized={"name": "search"},
+            input_str="test",
+            run_id=tool_id,
+            parent_run_id=chain_id,
+            name="custom_tool_name",
+        )
+
+        tool_evt = mock_exporter.enqueued[-1]
+        assert tool_evt.body["name"] == "custom_tool_name"
+
+    def test_tool_none_serialized(self, mock_exporter):
+        handler = _make_handler()
+        chain_id = uuid4()
+        tool_id = uuid4()
+
+        handler.on_chain_start(
+            serialized={"id": ["langchain", "Chain"], "name": "Chain"},
+            inputs={},
+            run_id=chain_id,
+            parent_run_id=None,
+        )
+
+        handler.on_tool_start(
+            serialized=None,
+            input_str="test",
+            run_id=tool_id,
+            parent_run_id=chain_id,
+        )
+
+        tool_evt = mock_exporter.enqueued[-1]
+        assert tool_evt.body["name"] == "tool"  # fallback
+
 
 # ── Retriever tests ──────────────────────────────────────────────────
 
@@ -439,6 +922,29 @@ class TestRetrieverCallbacks:
 
         end_evt = mock_exporter.enqueued[-1]
         assert end_evt.body["level"] == "ERROR"
+
+    def test_retriever_name_override(self, mock_exporter):
+        handler = _make_handler()
+        chain_id = uuid4()
+        ret_id = uuid4()
+
+        handler.on_chain_start(
+            serialized={"id": ["langchain", "Chain"], "name": "Chain"},
+            inputs={},
+            run_id=chain_id,
+            parent_run_id=None,
+        )
+
+        handler.on_retriever_start(
+            serialized={"name": "vectorstore"},
+            query="test",
+            run_id=ret_id,
+            parent_run_id=chain_id,
+            name="custom_retriever",
+        )
+
+        ret_evt = mock_exporter.enqueued[-1]
+        assert ret_evt.body["name"] == "custom_retriever"
 
 
 # ── Nested hierarchy tests ───────────────────────────────────────────
@@ -674,3 +1180,104 @@ class TestUsageExtraction:
         end_evt = mock_exporter.enqueued[-1]
         assert "promptTokens" not in end_evt.body
         assert "completionTokens" not in end_evt.body
+
+
+# ── Error handling / robustness tests ─────────────────────────────────
+
+
+class TestErrorHandling:
+    def test_callback_does_not_crash_on_unexpected_serialized(self, mock_exporter):
+        """Callbacks should not raise even with weird input."""
+        handler = _make_handler()
+        run_id = uuid4()
+
+        # Should not crash — just logs
+        handler.on_chain_start(
+            serialized=None,
+            inputs=None,
+            run_id=run_id,
+            parent_run_id=None,
+        )
+        assert len(mock_exporter.enqueued) == 2
+
+    def test_callback_does_not_crash_on_unknown_run_end(self, mock_exporter):
+        """Ending a run that was never started should be a no-op."""
+        handler = _make_handler()
+        run_id = uuid4()
+
+        # Should not crash
+        handler.on_chain_end(outputs={"x": 1}, run_id=run_id)
+        handler.on_llm_error(error=RuntimeError("err"), run_id=run_id)
+        handler.on_tool_end(output="x", run_id=run_id)
+        handler.on_retriever_error(error=RuntimeError("err"), run_id=run_id)
+
+        # No events should have been emitted (no matching obs)
+        assert len(mock_exporter.enqueued) == 0
+
+    def test_llm_start_with_none_serialized(self, mock_exporter):
+        handler = _make_handler()
+        chain_id = uuid4()
+        llm_id = uuid4()
+
+        handler.on_chain_start(
+            serialized={"id": ["langchain", "Chain"], "name": "Chain"},
+            inputs={},
+            run_id=chain_id,
+            parent_run_id=None,
+        )
+
+        handler.on_llm_start(
+            serialized=None,
+            prompts=["test"],
+            run_id=llm_id,
+            parent_run_id=chain_id,
+        )
+
+        gen_evt = mock_exporter.enqueued[-1]
+        assert gen_evt.type == "generation-create"
+        assert gen_evt.body["name"] == "LLM"  # fallback
+
+    def test_chat_model_start_with_none_serialized(self, mock_exporter):
+        handler = _make_handler()
+        chain_id = uuid4()
+        llm_id = uuid4()
+
+        handler.on_chain_start(
+            serialized={"id": ["langchain", "Chain"], "name": "Chain"},
+            inputs={},
+            run_id=chain_id,
+            parent_run_id=None,
+        )
+
+        handler.on_chat_model_start(
+            serialized=None,
+            messages=[[FakeMessage("human", "hi")]],
+            run_id=llm_id,
+            parent_run_id=chain_id,
+        )
+
+        gen_evt = mock_exporter.enqueued[-1]
+        assert gen_evt.type == "generation-create"
+        assert gen_evt.body["name"] == "ChatModel"  # fallback
+
+    def test_retriever_start_with_none_serialized(self, mock_exporter):
+        handler = _make_handler()
+        chain_id = uuid4()
+        ret_id = uuid4()
+
+        handler.on_chain_start(
+            serialized={"id": ["langchain", "Chain"], "name": "Chain"},
+            inputs={},
+            run_id=chain_id,
+            parent_run_id=None,
+        )
+
+        handler.on_retriever_start(
+            serialized=None,
+            query="test",
+            run_id=ret_id,
+            parent_run_id=chain_id,
+        )
+
+        ret_evt = mock_exporter.enqueued[-1]
+        assert ret_evt.body["name"] == "retriever"  # fallback

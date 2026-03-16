@@ -36,6 +36,7 @@ class LightraceCallbackHandler(BaseCallbackHandler):
         trace_name: str | None = None,
         metadata: dict[str, Any] | None = None,
         tags: list[str] | None = None,
+        client: Any = None,
     ) -> None:
         super().__init__()
         self._user_id = user_id
@@ -43,6 +44,7 @@ class LightraceCallbackHandler(BaseCallbackHandler):
         self._trace_name = trace_name
         self._metadata = metadata
         self._tags = tags
+        self._client = client
 
         # State tracking
         self._runs: dict[str, _ObsState] = {}
@@ -54,7 +56,9 @@ class LightraceCallbackHandler(BaseCallbackHandler):
     # ── helpers ──────────────────────────────────────────────────────
 
     def _get_exporter(self) -> Any:
-        """Return the global exporter (may be None)."""
+        """Return the exporter from client or global."""
+        if self._client is not None:
+            return self._client._exporter  # type: ignore[attr-defined]
         return sys.modules["lightrace.trace"]._exporter  # type: ignore[attr-defined]
 
     def _emit(self, event: TraceEvent) -> None:
@@ -72,15 +76,29 @@ class LightraceCallbackHandler(BaseCallbackHandler):
     @staticmethod
     def _extract_model_name(serialized: dict[str, Any], kwargs: dict[str, Any]) -> str | None:
         ser_kwargs = serialized.get("kwargs", {})
-        model = ser_kwargs.get("model_name") or ser_kwargs.get("model")
-        if model:
-            return str(model)
+        if isinstance(ser_kwargs, dict):
+            model = ser_kwargs.get("model_name") or ser_kwargs.get("model")
+            if model:
+                return str(model)
         inv = kwargs.get("invocation_params", {})
         if isinstance(inv, dict):
             model = inv.get("model_name") or inv.get("model")
             if model:
                 return str(model)
         return None
+
+    @staticmethod
+    def _extract_model_params(kwargs: dict[str, Any]) -> dict[str, Any] | None:
+        """Extract model parameters from invocation_params."""
+        inv_params = kwargs.get("invocation_params", {})
+        if not isinstance(inv_params, dict):
+            return None
+        model_params: dict[str, Any] = {}
+        for key in ("temperature", "max_tokens", "top_p", "frequency_penalty", "presence_penalty"):
+            val = inv_params.get(key)
+            if val is not None:
+                model_params[key] = val
+        return model_params if model_params else None
 
     @staticmethod
     def _convert_messages(messages: Sequence[Any]) -> list[list[dict[str, Any]]]:
@@ -90,7 +108,10 @@ class LightraceCallbackHandler(BaseCallbackHandler):
             converted: list[dict[str, Any]] = []
             for msg in message_list:
                 if hasattr(msg, "type") and hasattr(msg, "content"):
-                    converted.append({"role": msg.type, "content": msg.content})
+                    entry: dict[str, Any] = {"role": msg.type, "content": msg.content}
+                    if hasattr(msg, "tool_calls") and msg.tool_calls:
+                        entry["tool_calls"] = msg.tool_calls
+                    converted.append(entry)
                 elif isinstance(msg, dict):
                     converted.append(msg)
                 else:
@@ -100,21 +121,64 @@ class LightraceCallbackHandler(BaseCallbackHandler):
 
     @staticmethod
     def _extract_usage(response: LLMResult) -> dict[str, int] | None:
-        """Extract token usage from an LLMResult."""
+        """Extract token usage from an LLMResult, supporting multiple providers."""
+        usage: dict[str, Any] | None = None
+
+        # Try llm_output level first
         if response.llm_output and isinstance(response.llm_output, dict):
             usage = response.llm_output.get("token_usage") or response.llm_output.get("usage")
-            if isinstance(usage, dict):
-                result: dict[str, int] = {}
-                for src_key, dst_key in [
-                    ("prompt_tokens", "prompt_tokens"),
-                    ("completion_tokens", "completion_tokens"),
-                    ("total_tokens", "total_tokens"),
-                ]:
-                    if src_key in usage:
-                        result[dst_key] = int(usage[src_key])
-                if result:
-                    return result
-        return None
+
+        # Also check generation-level usage_metadata
+        if not usage and response.generations:
+            last_gen_list = response.generations[-1]
+            last_gen = last_gen_list[-1] if last_gen_list else None
+            if last_gen is not None:
+                gen_info = getattr(last_gen, "generation_info", None) or {}
+                if isinstance(gen_info, dict):
+                    usage = gen_info.get("usage_metadata")
+                if not usage:
+                    msg = getattr(last_gen, "message", None)
+                    if msg is not None and hasattr(msg, "usage_metadata"):
+                        um = msg.usage_metadata
+                        if isinstance(um, dict):
+                            usage = um
+
+        if not usage or not isinstance(usage, dict):
+            return None
+
+        # Normalize keys from various providers
+        result: dict[str, int] = {}
+        prompt = (
+            usage.get("prompt_tokens") or usage.get("input_tokens") or usage.get("promptTokens")
+        )
+        completion = (
+            usage.get("completion_tokens")
+            or usage.get("output_tokens")
+            or usage.get("completionTokens")
+        )
+        total = usage.get("total_tokens") or usage.get("totalTokens")
+
+        if prompt is not None:
+            result["prompt_tokens"] = int(prompt)
+        if completion is not None:
+            result["completion_tokens"] = int(completion)
+        if total is not None:
+            result["total_tokens"] = int(total)
+
+        return result if result else None
+
+    def _normalize_io(self, data: Any) -> Any:
+        """Recursively convert BaseMessage-like objects to plain dicts."""
+        if isinstance(data, dict):
+            return {k: self._normalize_io(v) for k, v in data.items()}
+        if isinstance(data, list):
+            return [self._normalize_io(item) for item in data]
+        if hasattr(data, "type") and hasattr(data, "content"):
+            result: dict[str, Any] = {"role": data.type, "content": data.content}
+            if hasattr(data, "tool_calls") and data.tool_calls:
+                result["tool_calls"] = data.tool_calls
+            return result
+        return data
 
     def _create_obs(
         self,
@@ -125,6 +189,7 @@ class LightraceCallbackHandler(BaseCallbackHandler):
         input_data: Any = None,
         model: str | None = None,
         metadata: dict[str, Any] | None = None,
+        model_parameters: dict[str, Any] | None = None,
     ) -> _ObsState:
         """Create an observation state, emit the create event, and store it."""
         rid = str(run_id)
@@ -211,6 +276,9 @@ class LightraceCallbackHandler(BaseCallbackHandler):
             "parentObservationId": parent_obs_id,
         }
 
+        if model_parameters:
+            body["modelParameters"] = model_parameters
+
         self._emit(
             TraceEvent(
                 event_id=generate_id(),
@@ -228,6 +296,7 @@ class LightraceCallbackHandler(BaseCallbackHandler):
             start_time=now,
             parent_obs_id=parent_obs_id,
             model=model,
+            model_parameters=model_parameters,
         )
         self._runs[rid] = obs
         return obs
@@ -270,6 +339,9 @@ class LightraceCallbackHandler(BaseCallbackHandler):
         if obs.model:
             body["model"] = obs.model
 
+        if obs.model_parameters:
+            body["modelParameters"] = obs.model_parameters
+
         if usage:
             if "prompt_tokens" in usage:
                 body["promptTokens"] = usage["prompt_tokens"]
@@ -306,43 +378,53 @@ class LightraceCallbackHandler(BaseCallbackHandler):
 
     def on_chain_start(
         self,
-        serialized: dict[str, Any],
-        inputs: dict[str, Any],
+        serialized: dict[str, Any] | None,
+        inputs: dict[str, Any] | Any | None,
         *,
         run_id: UUID,
         parent_run_id: UUID | None = None,
         tags: list[str] | None = None,
         metadata: dict[str, Any] | None = None,
+        name: str | None = None,
         **kwargs: Any,
     ) -> None:
-        # Determine if this is an agent
-        class_path = serialized.get("id", [])
-        name_str = serialized.get("name", "")
-        full_path = ":".join(class_path) if isinstance(class_path, list) else str(class_path)
-        is_agent = "agent" in full_path.lower() or "agent" in name_str.lower()
-        obs_type = "agent" if is_agent else "chain"
-        name = name_str or (
-            class_path[-1] if isinstance(class_path, list) and class_path else "chain"
-        )
+        try:
+            serialized = serialized or {}
+            inputs = self._normalize_io(inputs) if inputs is not None else None
+            # Determine if this is an agent
+            class_path = serialized.get("id", [])
+            name_str = name or serialized.get("name", "")
+            full_path = ":".join(class_path) if isinstance(class_path, list) else str(class_path)
+            is_agent = "agent" in full_path.lower() or "agent" in name_str.lower()
+            obs_type = "agent" if is_agent else "chain"
+            resolved_name = name_str or (
+                class_path[-1] if isinstance(class_path, list) and class_path else "chain"
+            )
 
-        self._create_obs(
-            run_id=run_id,
-            parent_run_id=parent_run_id,
-            obs_type=obs_type,
-            name=name,
-            input_data=inputs,
-            metadata=metadata,
-        )
+            self._create_obs(
+                run_id=run_id,
+                parent_run_id=parent_run_id,
+                obs_type=obs_type,
+                name=resolved_name,
+                input_data=inputs,
+                metadata=metadata,
+            )
+        except Exception:
+            logger.exception("Error in on_chain_start")
 
     def on_chain_end(
         self,
-        outputs: dict[str, Any],
+        outputs: dict[str, Any] | Any | None,
         *,
         run_id: UUID,
         parent_run_id: UUID | None = None,
         **kwargs: Any,
     ) -> None:
-        self._end_obs(run_id, output=outputs)
+        try:
+            outputs = self._normalize_io(outputs) if outputs is not None else None
+            self._end_obs(run_id, output=outputs)
+        except Exception:
+            logger.exception("Error in on_chain_end")
 
     def on_chain_error(
         self,
@@ -352,67 +434,94 @@ class LightraceCallbackHandler(BaseCallbackHandler):
         parent_run_id: UUID | None = None,
         **kwargs: Any,
     ) -> None:
-        # LangGraph uses GraphBubbleUp for internal control flow — not a real error
-        error_type = type(error).__name__
-        if error_type == "GraphBubbleUp":
-            self._end_obs(run_id)
-            return
-        self._end_obs(run_id, level="ERROR", status_message=str(error))
+        try:
+            # LangGraph uses GraphBubbleUp for internal control flow — not a real error
+            error_type = type(error).__name__
+            if error_type == "GraphBubbleUp":
+                self._end_obs(run_id)
+                return
+            self._end_obs(run_id, level="ERROR", status_message=str(error))
+        except Exception:
+            logger.exception("Error in on_chain_error")
 
     # ── LLM callbacks ────────────────────────────────────────────────
 
     def on_llm_start(
         self,
-        serialized: dict[str, Any],
+        serialized: dict[str, Any] | None,
         prompts: list[str],
         *,
         run_id: UUID,
         parent_run_id: UUID | None = None,
         tags: list[str] | None = None,
         metadata: dict[str, Any] | None = None,
+        name: str | None = None,
         **kwargs: Any,
     ) -> None:
-        model = self._extract_model_name(serialized, kwargs)
-        name = serialized.get("name", "") or (
-            serialized.get("id", ["LLM"])[-1] if isinstance(serialized.get("id"), list) else "LLM"
-        )
-        self._create_obs(
-            run_id=run_id,
-            parent_run_id=parent_run_id,
-            obs_type="generation",
-            name=name,
-            input_data=prompts,
-            model=model,
-            metadata=metadata,
-        )
+        try:
+            serialized = serialized or {}
+            model = self._extract_model_name(serialized, kwargs)
+            model_params = self._extract_model_params(kwargs)
+            resolved_name = (
+                name
+                or serialized.get("name", "")
+                or (
+                    serialized.get("id", ["LLM"])[-1]
+                    if isinstance(serialized.get("id"), list)
+                    else "LLM"
+                )
+            )
+            self._create_obs(
+                run_id=run_id,
+                parent_run_id=parent_run_id,
+                obs_type="generation",
+                name=resolved_name,
+                input_data=prompts,
+                model=model,
+                metadata=metadata,
+                model_parameters=model_params,
+            )
+        except Exception:
+            logger.exception("Error in on_llm_start")
 
     def on_chat_model_start(
         self,
-        serialized: dict[str, Any],
+        serialized: dict[str, Any] | None,
         messages: list[list[Any]],
         *,
         run_id: UUID,
         parent_run_id: UUID | None = None,
         tags: list[str] | None = None,
         metadata: dict[str, Any] | None = None,
+        name: str | None = None,
         **kwargs: Any,
     ) -> None:
-        model = self._extract_model_name(serialized, kwargs)
-        name = serialized.get("name", "") or (
-            serialized.get("id", ["ChatModel"])[-1]
-            if isinstance(serialized.get("id"), list)
-            else "ChatModel"
-        )
-        converted = self._convert_messages(messages)
-        self._create_obs(
-            run_id=run_id,
-            parent_run_id=parent_run_id,
-            obs_type="generation",
-            name=name,
-            input_data=converted,
-            model=model,
-            metadata=metadata,
-        )
+        try:
+            serialized = serialized or {}
+            model = self._extract_model_name(serialized, kwargs)
+            model_params = self._extract_model_params(kwargs)
+            resolved_name = (
+                name
+                or serialized.get("name", "")
+                or (
+                    serialized.get("id", ["ChatModel"])[-1]
+                    if isinstance(serialized.get("id"), list)
+                    else "ChatModel"
+                )
+            )
+            converted = self._convert_messages(messages)
+            self._create_obs(
+                run_id=run_id,
+                parent_run_id=parent_run_id,
+                obs_type="generation",
+                name=resolved_name,
+                input_data=converted,
+                model=model,
+                metadata=metadata,
+                model_parameters=model_params,
+            )
+        except Exception:
+            logger.exception("Error in on_chat_model_start")
 
     def on_llm_end(
         self,
@@ -422,15 +531,45 @@ class LightraceCallbackHandler(BaseCallbackHandler):
         parent_run_id: UUID | None = None,
         **kwargs: Any,
     ) -> None:
-        # Extract output text
-        output_texts: list[str] = []
-        for gen_list in response.generations:
-            for gen in gen_list:
-                output_texts.append(gen.text)
-        output = output_texts[0] if len(output_texts) == 1 else output_texts
+        try:
+            # Try to extract model name from response if not already set
+            rid = str(run_id)
+            obs = self._runs.get(rid)
+            if obs is not None and not obs.model:
+                if response.llm_output and isinstance(response.llm_output, dict):
+                    model = response.llm_output.get("model_name") or response.llm_output.get(
+                        "model"
+                    )
+                    if model:
+                        obs.model = str(model)
 
-        usage = self._extract_usage(response)
-        self._end_obs(run_id, output=output, usage=usage)
+            # Extract output — handle ChatGeneration messages
+            output: Any = None
+            if response.generations and response.generations[-1]:
+                last_gen = response.generations[-1][-1]
+                if hasattr(last_gen, "message") and last_gen.message is not None:
+                    msg = last_gen.message
+                    output_dict: dict[str, Any] = {
+                        "role": getattr(msg, "type", "assistant"),
+                        "content": getattr(msg, "content", ""),
+                    }
+                    if hasattr(msg, "tool_calls") and msg.tool_calls:
+                        output_dict["tool_calls"] = msg.tool_calls
+                    output = output_dict
+                else:
+                    # Fall back to collecting all text outputs
+                    output_texts: list[str] = []
+                    for gen_list in response.generations:
+                        for gen in gen_list:
+                            output_texts.append(gen.text)
+                    output = output_texts[0] if len(output_texts) == 1 else output_texts
+            else:
+                output = None
+
+            usage = self._extract_usage(response)
+            self._end_obs(run_id, output=output, usage=usage)
+        except Exception:
+            logger.exception("Error in on_llm_end")
 
     def on_llm_new_token(
         self,
@@ -440,12 +579,15 @@ class LightraceCallbackHandler(BaseCallbackHandler):
         parent_run_id: UUID | None = None,
         **kwargs: Any,
     ) -> None:
-        rid = str(run_id)
-        if rid not in self._completion_start_times:
-            self._completion_start_times.add(rid)
-            obs = self._runs.get(rid)
-            if obs is not None:
-                obs.completion_start_time = datetime.now(timezone.utc).isoformat() + "Z"
+        try:
+            rid = str(run_id)
+            if rid not in self._completion_start_times:
+                self._completion_start_times.add(rid)
+                obs = self._runs.get(rid)
+                if obs is not None:
+                    obs.completion_start_time = datetime.now(timezone.utc).isoformat() + "Z"
+        except Exception:
+            logger.exception("Error in on_llm_new_token")
 
     def on_llm_error(
         self,
@@ -455,30 +597,38 @@ class LightraceCallbackHandler(BaseCallbackHandler):
         parent_run_id: UUID | None = None,
         **kwargs: Any,
     ) -> None:
-        self._end_obs(run_id, level="ERROR", status_message=str(error))
+        try:
+            self._end_obs(run_id, level="ERROR", status_message=str(error))
+        except Exception:
+            logger.exception("Error in on_llm_error")
 
     # ── Tool callbacks ───────────────────────────────────────────────
 
     def on_tool_start(
         self,
-        serialized: dict[str, Any],
+        serialized: dict[str, Any] | None,
         input_str: str,
         *,
         run_id: UUID,
         parent_run_id: UUID | None = None,
         tags: list[str] | None = None,
         metadata: dict[str, Any] | None = None,
+        name: str | None = None,
         **kwargs: Any,
     ) -> None:
-        name = serialized.get("name", "tool")
-        self._create_obs(
-            run_id=run_id,
-            parent_run_id=parent_run_id,
-            obs_type="tool",
-            name=name,
-            input_data=input_str,
-            metadata=metadata,
-        )
+        try:
+            serialized = serialized or {}
+            resolved_name = name or serialized.get("name", "tool")
+            self._create_obs(
+                run_id=run_id,
+                parent_run_id=parent_run_id,
+                obs_type="tool",
+                name=resolved_name,
+                input_data=input_str,
+                metadata=metadata,
+            )
+        except Exception:
+            logger.exception("Error in on_tool_start")
 
     def on_tool_end(
         self,
@@ -488,7 +638,10 @@ class LightraceCallbackHandler(BaseCallbackHandler):
         parent_run_id: UUID | None = None,
         **kwargs: Any,
     ) -> None:
-        self._end_obs(run_id, output=output)
+        try:
+            self._end_obs(run_id, output=output)
+        except Exception:
+            logger.exception("Error in on_tool_end")
 
     def on_tool_error(
         self,
@@ -498,30 +651,38 @@ class LightraceCallbackHandler(BaseCallbackHandler):
         parent_run_id: UUID | None = None,
         **kwargs: Any,
     ) -> None:
-        self._end_obs(run_id, level="ERROR", status_message=str(error))
+        try:
+            self._end_obs(run_id, level="ERROR", status_message=str(error))
+        except Exception:
+            logger.exception("Error in on_tool_error")
 
     # ── Retriever callbacks ──────────────────────────────────────────
 
     def on_retriever_start(
         self,
-        serialized: dict[str, Any],
+        serialized: dict[str, Any] | None,
         query: str,
         *,
         run_id: UUID,
         parent_run_id: UUID | None = None,
         tags: list[str] | None = None,
         metadata: dict[str, Any] | None = None,
+        name: str | None = None,
         **kwargs: Any,
     ) -> None:
-        name = serialized.get("name", "retriever")
-        self._create_obs(
-            run_id=run_id,
-            parent_run_id=parent_run_id,
-            obs_type="span",
-            name=name,
-            input_data=query,
-            metadata=metadata,
-        )
+        try:
+            serialized = serialized or {}
+            resolved_name = name or serialized.get("name", "retriever")
+            self._create_obs(
+                run_id=run_id,
+                parent_run_id=parent_run_id,
+                obs_type="span",
+                name=resolved_name,
+                input_data=query,
+                metadata=metadata,
+            )
+        except Exception:
+            logger.exception("Error in on_retriever_start")
 
     def on_retriever_end(
         self,
@@ -531,8 +692,11 @@ class LightraceCallbackHandler(BaseCallbackHandler):
         parent_run_id: UUID | None = None,
         **kwargs: Any,
     ) -> None:
-        serialized_docs = json_serializable(list(documents))
-        self._end_obs(run_id, output=serialized_docs)
+        try:
+            serialized_docs = json_serializable(list(documents))
+            self._end_obs(run_id, output=serialized_docs)
+        except Exception:
+            logger.exception("Error in on_retriever_end")
 
     def on_retriever_error(
         self,
@@ -542,7 +706,10 @@ class LightraceCallbackHandler(BaseCallbackHandler):
         parent_run_id: UUID | None = None,
         **kwargs: Any,
     ) -> None:
-        self._end_obs(run_id, level="ERROR", status_message=str(error))
+        try:
+            self._end_obs(run_id, level="ERROR", status_message=str(error))
+        except Exception:
+            logger.exception("Error in on_retriever_error")
 
 
 class _ObsState:
@@ -556,6 +723,7 @@ class _ObsState:
         "start_time",
         "parent_obs_id",
         "model",
+        "model_parameters",
         "completion_start_time",
     )
 
@@ -568,6 +736,7 @@ class _ObsState:
         start_time: datetime,
         parent_obs_id: str | None,
         model: str | None,
+        model_parameters: dict[str, Any] | None = None,
     ) -> None:
         self.obs_id = obs_id
         self.trace_id = trace_id
@@ -576,4 +745,5 @@ class _ObsState:
         self.start_time = start_time
         self.parent_obs_id = parent_obs_id
         self.model = model
+        self.model_parameters = model_parameters
         self.completion_start_time: str | None = None
