@@ -30,11 +30,11 @@ jobs:
     name: Release
     runs-on: ubuntu-latest
     if: github.ref == 'refs/heads/main'
-    environment: protected branches
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          token: ${{ secrets.RELEASE_TOKEN }}
 
       - uses: astral-sh/setup-uv@v6
 
@@ -67,6 +67,8 @@ jobs:
       - name: Publish to PyPI
         if: ${{ !inputs.dry-run }}
         uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          password: ${{ secrets.PYPI_API_TOKEN }}
 
       - name: Commit & tag
         if: ${{ !inputs.dry-run }}
