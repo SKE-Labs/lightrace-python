@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "lightrace"
-version = "0.1.4"
+version = "1.0.0"
 description = "Lightweight LLM tracing SDK with remote tool invocation"
 readme = "README.md"
 license = "MIT"
