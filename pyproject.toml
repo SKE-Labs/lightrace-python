@@ -9,7 +9,7 @@ description = "Lightweight LLM tracing SDK with remote tool invocation"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.10"
-authors = [{ name = "Lightrace Contributors" }]
+authors = [{ name = "Ganchuluun Narantsatsralt", email = "tsatsralt@swifttech.cloud"}]
 keywords = ["llm", "tracing", "observability", "langfuse", "opentelemetry", "tool-invocation"]
 classifiers = [
     "Development Status :: 3 - Alpha",
