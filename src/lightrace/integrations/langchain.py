@@ -101,7 +101,16 @@ class LightraceCallbackHandler(BaseCallbackHandler):
         if not isinstance(inv_params, dict):
             return None
         model_params: dict[str, Any] = {}
-        for key in ("temperature", "max_tokens", "top_p", "frequency_penalty", "presence_penalty"):
+        for key in (
+            "temperature",
+            "max_tokens",
+            "top_p",
+            "frequency_penalty",
+            "presence_penalty",
+            "tools",
+            "functions",
+            "tool_choice",
+        ):
             val = inv_params.get(key)
             if val is not None:
                 model_params[key] = val
