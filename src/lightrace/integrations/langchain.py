@@ -506,12 +506,23 @@ class LightraceCallbackHandler(BaseCallbackHandler):
                 )
             )
             converted = self._convert_messages(messages)
+            # Include tool definitions in input when present
+            inv_params = kwargs.get("invocation_params", {})
+            tools = (
+                inv_params.get("tools") or inv_params.get("functions")
+                if isinstance(inv_params, dict)
+                else None
+            )
+            if tools:
+                input_data: Any = {"messages": converted, "tools": tools}
+            else:
+                input_data = converted
             self._create_obs(
                 run_id=run_id,
                 parent_run_id=parent_run_id,
                 obs_type="generation",
                 name=resolved_name,
-                input_data=converted,
+                input_data=input_data,
                 model=model,
                 metadata=metadata,
                 model_parameters=model_params,
