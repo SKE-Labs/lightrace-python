@@ -19,6 +19,7 @@ from .trace import (
     _get_tool_registry,
     _set_client_defaults,
     _set_otel_exporter,
+    _tool_registry,
 )
 from .utils import generate_id, json_serializable
 
@@ -163,6 +164,57 @@ class Lightrace:
                 logger.error("Failed to register tools: %s", e)
 
         threading.Thread(target=_do_register, daemon=True, name="lightrace-register").start()
+
+    def register_tools(self, *tools: Any) -> None:
+        """Register tools for invocation from the dashboard.
+
+        Accepts LangChain BaseTool objects or plain callables.
+        After registration, re-syncs with the backend via HTTP.
+        """
+        from .utils import build_json_schema
+
+        for t in tools:
+            if hasattr(t, "name") and hasattr(t, "args_schema"):
+                name = t.name
+                func = getattr(t, "coroutine", None) or getattr(t, "func", None)
+                if func is None:
+                    func = getattr(t, "_arun", None) or getattr(t, "_run", None)
+                if func is None:
+                    logger.warning("Cannot extract callable from tool %r — skipping", name)
+                    continue
+
+                input_schema = None
+                args_schema = getattr(t, "args_schema", None)
+                if args_schema is not None:
+                    try:
+                        input_schema = args_schema.model_json_schema()
+                    except Exception:
+                        try:
+                            input_schema = args_schema.schema()
+                        except Exception:
+                            pass
+
+                description = getattr(t, "description", None)
+                _tool_registry[name] = {
+                    "func": func,
+                    "input_schema": input_schema,
+                    "description": description,
+                }
+                logger.debug("Registered LangChain tool: %s", name)
+
+            elif callable(t):
+                name = getattr(t, "__name__", str(t))
+                _tool_registry[name] = {
+                    "func": t,
+                    "input_schema": build_json_schema(t),
+                    "description": None,
+                }
+                logger.debug("Registered callable tool: %s", name)
+            else:
+                logger.warning("Cannot register tool %r — not a callable or BaseTool", t)
+
+        if _tool_registry and self._enabled:
+            self._register_tools_http()
 
     # ── Flush / shutdown ──────────────────────────────────────────────
 
