@@ -42,7 +42,9 @@ class TestDevServer:
 
             status, body = self._request(port, "/health")
             assert status == 200
-            assert body["status"] == "ok"
+            assert body["code"] == 200
+            assert body["message"] == "OK"
+            assert body["response"]["status"] == "ok"
         finally:
             server.stop()
 
@@ -59,8 +61,9 @@ class TestDevServer:
                 port, "/invoke", method="POST", body={"tool": "add", "input": {"a": 3, "b": 4}}
             )
             assert status == 200
-            assert body["output"]["sum"] == 7
-            assert body["durationMs"] >= 0
+            assert body["code"] == 200
+            assert body["response"]["output"]["sum"] == 7
+            assert body["response"]["durationMs"] >= 0
         finally:
             server.stop()
 
@@ -72,7 +75,9 @@ class TestDevServer:
                 port, "/invoke", method="POST", body={"tool": "nope", "input": {}}
             )
             assert status == 404
-            assert "Tool not found" in body["error"]
+            assert body["code"] == 404
+            assert "Tool not found" in body["message"]
+            assert body["response"] is None
         finally:
             server.stop()
 
@@ -89,8 +94,9 @@ class TestDevServer:
                 port, "/invoke", method="POST", body={"tool": "broken", "input": None}
             )
             assert status == 200
-            assert body["output"] is None
-            assert body["error"] == "tool broke"
+            assert body["code"] == 200
+            assert body["response"]["output"] is None
+            assert body["response"]["error"] == "tool broke"
         finally:
             server.stop()
 
@@ -108,6 +114,8 @@ class TestDevServer:
                 headers={"Authorization": "Bearer wrong"},
             )
             assert status == 401
+            assert body["code"] == 401
+            assert body["message"] == "Unauthorized"
         finally:
             server.stop()
 
@@ -125,7 +133,8 @@ class TestDevServer:
                 headers={"Authorization": "Bearer pk-secret"},
             )
             assert status == 200
-            assert body["output"] == "hi"
+            assert body["code"] == 200
+            assert body["response"]["output"] == "hi"
         finally:
             server.stop()
 

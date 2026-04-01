@@ -3,17 +3,24 @@
 Starts automatically with ``Lightrace()`` to accept tool invocation
 requests from the Lightrace dashboard (proxied via the backend).
 
-Uses stdlib ``http.server`` in a background thread — zero extra dependencies.
+Uses FastAPI + uvicorn for production-grade async HTTP handling.
 """
 
 from __future__ import annotations
 
-import json
+import asyncio
 import logging
 import threading
 import time
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
+
+from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request as StarletteRequest
+from starlette.responses import Response as StarletteResponse
 
 from .trace import _get_tool_registry
 from .utils import json_serializable
@@ -23,87 +30,98 @@ logger = logging.getLogger("lightrace")
 MAX_BODY_BYTES = 1_048_576  # 1 MB
 
 
-class _InvokeHandler(BaseHTTPRequestHandler):
-    """HTTP request handler for the SDK dev server."""
+class _BodySizeLimitMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: StarletteRequest, call_next: Any) -> StarletteResponse:
+        content_length = request.headers.get("content-length")
+        if content_length and int(content_length) > MAX_BODY_BYTES:
+            return JSONResponse(
+                status_code=413,
+                content={"code": 413, "message": "Request body too large", "response": None},
+            )
+        return await call_next(request)
 
-    public_key: str = ""
 
-    def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
-        pass
+class InvokeRequest(BaseModel):
+    tool: str
+    input: Any = None
 
-    def _set_cors_headers(self) -> None:
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
 
-    def _send_json(self, status: int, data: Any) -> None:
-        body = json.dumps(data).encode()
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json")
-        self._set_cors_headers()
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+def _api_response(code: int, message: str, response: Any = None) -> JSONResponse:
+    return JSONResponse(
+        status_code=code,
+        content={"code": code, "message": message, "response": response},
+    )
 
-    def do_OPTIONS(self) -> None:  # noqa: N802
-        self.send_response(204)
-        self._set_cors_headers()
-        self.end_headers()
 
-    def do_GET(self) -> None:  # noqa: N802
-        if self.path == "/health":
-            self._send_json(200, {"status": "ok"})
-        else:
-            self._send_json(404, {"error": "Not found"})
+def _create_app(public_key: str) -> FastAPI:
+    app = FastAPI(title="Lightrace Dev Server", docs_url="/docs", redoc_url=None)
 
-    def do_POST(self) -> None:  # noqa: N802
-        if self.path != "/invoke":
-            self._send_json(404, {"error": "Not found"})
-            return
+    app.add_middleware(_BodySizeLimitMiddleware)
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
 
-        auth_header = self.headers.get("Authorization", "")
-        if self.public_key and auth_header != f"Bearer {self.public_key}":
-            self._send_json(401, {"error": "Unauthorized"})
-            return
+    @app.get("/health")
+    async def health() -> JSONResponse:
+        return _api_response(200, "OK", {"status": "ok"})
 
-        content_length = int(self.headers.get("Content-Length", 0))
-        if content_length > MAX_BODY_BYTES:
-            self._send_json(413, {"error": "Request body too large"})
-            return
-
-        raw_body = self.rfile.read(content_length)
-
-        try:
-            body = json.loads(raw_body)
-        except (json.JSONDecodeError, ValueError):
-            self._send_json(400, {"error": "Invalid JSON body"})
-            return
-
-        tool_name = body.get("tool", "")
-        input_data = body.get("input")
+    @app.post("/invoke")
+    async def invoke(req: InvokeRequest, request: Request) -> JSONResponse:
+        if public_key:
+            auth = request.headers.get("Authorization", "")
+            if auth != f"Bearer {public_key}":
+                return _api_response(401, "Unauthorized")
 
         registry = _get_tool_registry()
-        tool_info = registry.get(tool_name)
+        tool_info = registry.get(req.tool)
         if not tool_info:
-            self._send_json(404, {"error": f"Tool not found: {tool_name}"})
-            return
+            return _api_response(404, f"Tool not found: {req.tool}")
 
         func = tool_info["func"]
+        input_data = req.input
         start = time.monotonic()
 
         try:
-            if isinstance(input_data, dict):
-                result = func(**input_data)
-            elif input_data is not None:
-                result = func(input_data)
+            if asyncio.iscoroutinefunction(func):
+                if isinstance(input_data, dict):
+                    result = await func(**input_data)
+                elif input_data is not None:
+                    result = await func(input_data)
+                else:
+                    result = await func()
             else:
-                result = func()
+                if isinstance(input_data, dict):
+                    result = await asyncio.to_thread(func, **input_data)
+                elif input_data is not None:
+                    result = await asyncio.to_thread(func, input_data)
+                else:
+                    result = await asyncio.to_thread(func)
 
             duration_ms = round((time.monotonic() - start) * 1000)
-            self._send_json(200, {"output": json_serializable(result), "durationMs": duration_ms})
+            return _api_response(
+                200,
+                "OK",
+                {
+                    "output": json_serializable(result),
+                    "durationMs": duration_ms,
+                },
+            )
         except Exception as e:
             duration_ms = round((time.monotonic() - start) * 1000)
-            self._send_json(200, {"output": None, "error": str(e), "durationMs": duration_ms})
+            return _api_response(
+                200,
+                "OK",
+                {
+                    "output": None,
+                    "error": str(e),
+                    "durationMs": duration_ms,
+                },
+            )
+
+    return app
 
 
 class DevServer:
@@ -112,37 +130,68 @@ class DevServer:
     def __init__(self, port: int = 0, public_key: str = ""):
         self._port = port
         self._public_key = public_key
-        self._server: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
         self._assigned_port: int | None = None
+        self._server: Any = None
 
     def start(self) -> int:
         """Start the dev server in a background thread. Returns the assigned port."""
         if self._server is not None:
             return self._assigned_port or self._port
 
-        handler = type(
-            "_Handler",
-            (_InvokeHandler,),
-            {"public_key": self._public_key},
-        )
+        import uvicorn
 
-        self._server = ThreadingHTTPServer(("127.0.0.1", self._port), handler)
-        self._assigned_port = self._server.server_address[1]
+        app = _create_app(self._public_key)
 
-        self._thread = threading.Thread(
-            target=self._server.serve_forever,
-            daemon=True,
-            name="lightrace-dev-server",
+        ready = threading.Event()
+        assigned_port_holder: list[int] = []
+
+        config = uvicorn.Config(
+            app,
+            host="127.0.0.1",
+            port=self._port,
+            log_level="warning",
         )
+        server = uvicorn.Server(config)
+
+        original_startup = server.startup
+
+        async def _startup_with_port(*args: Any, **kwargs: Any) -> None:
+            await original_startup(*args, **kwargs)
+            for s in server.servers:
+                for sock in s.sockets:
+                    addr = sock.getsockname()
+                    if isinstance(addr, tuple):
+                        assigned_port_holder.append(addr[1])
+                        break
+                if assigned_port_holder:
+                    break
+            ready.set()
+
+        server.startup = _startup_with_port  # type: ignore[assignment]
+
+        def _run() -> None:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            loop.run_until_complete(server.serve())
+
+        self._thread = threading.Thread(target=_run, daemon=True, name="lightrace-dev-server")
         self._thread.start()
 
+        if not ready.wait(timeout=10.0) or not assigned_port_holder:
+            server.should_exit = True
+            raise RuntimeError("Dev server failed to start within 10 seconds")
+
+        self._assigned_port = assigned_port_holder[0]
+        self._server = server
         return self._assigned_port
 
     def stop(self) -> None:
         """Stop the dev server."""
         if self._server is not None:
-            self._server.shutdown()
+            self._server.should_exit = True
+            if self._thread:
+                self._thread.join(timeout=5.0)
             self._server = None
             self._thread = None
             self._assigned_port = None
