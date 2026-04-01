@@ -113,11 +113,11 @@ class Observation:
             if self._usage and self.type == "generation":
                 usage_details: dict[str, int] = {}
                 if "prompt_tokens" in self._usage:
-                    usage_details["input"] = self._usage["prompt_tokens"]
+                    usage_details["promptTokens"] = self._usage["prompt_tokens"]
                 if "completion_tokens" in self._usage:
-                    usage_details["output"] = self._usage["completion_tokens"]
+                    usage_details["completionTokens"] = self._usage["completion_tokens"]
                 if "total_tokens" in self._usage:
-                    usage_details["total"] = self._usage["total_tokens"]
+                    usage_details["totalTokens"] = self._usage["total_tokens"]
                 if usage_details:
                     span.set_attribute(attrs.OBSERVATION_USAGE_DETAILS, json.dumps(usage_details))
 

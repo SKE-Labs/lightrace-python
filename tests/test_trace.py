@@ -236,9 +236,9 @@ class TestTraceDecorator:
         spans = exporter.get_finished_spans()
         attrs = _get_attrs(spans[0])
         usage = attrs.get("lightrace.observation.usage_details", "")
-        assert '"input": 10' in usage
-        assert '"output": 50' in usage
-        assert '"total": 60' in usage
+        assert '"promptTokens": 10' in usage
+        assert '"completionTokens": 50' in usage
+        assert '"totalTokens": 60' in usage
 
 
 class TestTraceDecoratorAsync:
@@ -300,6 +300,6 @@ class TestTraceDecoratorAsync:
         spans = exporter.get_finished_spans()
         attrs = _get_attrs(spans[0])
         usage = attrs.get("lightrace.observation.usage_details", "")
-        assert '"input": 5' in usage
-        assert '"output": 20' in usage
-        assert '"total": 25' in usage
+        assert '"promptTokens": 5' in usage
+        assert '"completionTokens": 20' in usage
+        assert '"totalTokens": 25' in usage

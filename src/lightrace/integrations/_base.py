@@ -294,11 +294,11 @@ class TracingMixin:
             if usage:
                 usage_details: dict[str, int] = {}
                 if "prompt_tokens" in usage:
-                    usage_details["input"] = usage["prompt_tokens"]
+                    usage_details["promptTokens"] = usage["prompt_tokens"]
                 if "completion_tokens" in usage:
-                    usage_details["output"] = usage["completion_tokens"]
+                    usage_details["completionTokens"] = usage["completion_tokens"]
                 if "total_tokens" in usage:
-                    usage_details["total"] = usage["total_tokens"]
+                    usage_details["totalTokens"] = usage["total_tokens"]
                 if usage_details:
                     span.set_attribute(attrs.OBSERVATION_USAGE_DETAILS, json.dumps(usage_details))
 

@@ -201,9 +201,9 @@ class TestAnthropicInstrumentor:
         assert len(spans) == 1
         attrs = _get_attrs(spans[0])
         usage = json.loads(attrs.get("lightrace.observation.usage_details", "{}"))
-        assert usage.get("input") == 200
-        assert usage.get("output") == 80
-        assert usage.get("total") == 280
+        assert usage.get("promptTokens") == 200
+        assert usage.get("completionTokens") == 80
+        assert usage.get("totalTokens") == 280
 
     def test_cache_token_extraction(self, otel_capture: InMemorySpanExporter) -> None:
         """Prompt caching tokens should be included in usage extraction."""
@@ -228,8 +228,8 @@ class TestAnthropicInstrumentor:
         spans = otel_capture.get_finished_spans()
         attrs = _get_attrs(spans[0])
         usage = json.loads(attrs.get("lightrace.observation.usage_details", "{}"))
-        assert usage.get("input") == 100
-        assert usage.get("output") == 50
+        assert usage.get("promptTokens") == 100
+        assert usage.get("completionTokens") == 50
 
     def test_tool_use_extraction(self, otel_capture: InMemorySpanExporter) -> None:
         response = FakeMessage(

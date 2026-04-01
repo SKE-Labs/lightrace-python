@@ -99,7 +99,7 @@ class TestGeneration:
         attrs = dict(gen_span.attributes or {})
         assert attrs.get("lightrace.observation.type") == "GENERATION"
         assert attrs.get("lightrace.observation.model") == "gpt-4o"
-        assert "input" in (attrs.get("lightrace.observation.usage_details") or "")
+        assert "promptTokens" in (attrs.get("lightrace.observation.usage_details") or "")
 
     def test_generation_usage_at_creation(self, otel_setup):
         exporter, lt = otel_setup
@@ -114,7 +114,7 @@ class TestGeneration:
         spans = exporter.get_finished_spans()
         gen_span = next(s for s in spans if s.name == "llm-call")
         attrs = dict(gen_span.attributes or {})
-        assert "input" in (attrs.get("lightrace.observation.usage_details") or "")
+        assert "promptTokens" in (attrs.get("lightrace.observation.usage_details") or "")
 
 
 class TestEvent:

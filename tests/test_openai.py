@@ -248,9 +248,9 @@ class TestOpenAIChatCompletions:
         spans = otel_capture.get_finished_spans()
         attrs = _get_attrs(spans[0])
         usage = json.loads(attrs.get("lightrace.observation.usage_details", "{}"))
-        assert usage.get("input") == 100
-        assert usage.get("output") == 50
-        assert usage.get("total") == 150
+        assert usage.get("promptTokens") == 100
+        assert usage.get("completionTokens") == 50
+        assert usage.get("totalTokens") == 150
 
     def test_tool_calls_extraction(self, otel_capture: InMemorySpanExporter) -> None:
         response = FakeCompletion(
@@ -373,8 +373,8 @@ class TestOpenAIResponsesAPI:
         spans = otel_capture.get_finished_spans()
         attrs = _get_attrs(spans[0])
         usage = json.loads(attrs.get("lightrace.observation.usage_details", "{}"))
-        assert usage.get("input") == 50
-        assert usage.get("output") == 25
+        assert usage.get("promptTokens") == 50
+        assert usage.get("completionTokens") == 25
 
     def test_responses_with_tools(self, otel_capture: InMemorySpanExporter) -> None:
         client = FakeClient()
