@@ -38,7 +38,8 @@ class _BodySizeLimitMiddleware(BaseHTTPMiddleware):
                 status_code=413,
                 content={"code": 413, "message": "Request body too large", "response": None},
             )
-        return await call_next(request)
+        response: StarletteResponse = await call_next(request)
+        return response
 
 
 class InvokeRequest(BaseModel):
