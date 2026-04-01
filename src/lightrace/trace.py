@@ -84,6 +84,7 @@ def trace(
             _tool_registry[obs_name] = {
                 "func": func,
                 "input_schema": build_json_schema(func),
+                "description": None,
             }
 
         if asyncio.iscoroutinefunction(func):
