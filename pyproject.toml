@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "lightrace"
-version = "1.0.6"
+version = "1.0.7"
 description = "Agentic development kit — LLM tracing, tool management, and agent primitives"
 readme = "README.md"
 license = "MIT"
