@@ -1,6 +1,18 @@
-# lightrace-python
+<p align="center">
+  <img src="https://raw.githubusercontent.com/SKE-Labs/lightrace/main/packages/frontend/public/white_transparent.png" alt="LightRace" width="280" />
+</p>
 
-Lightweight LLM tracing SDK for Python with remote tool invocation.
+<h1 align="center">lightrace-python</h1>
+
+<p align="center">
+  <a href="https://pypi.org/project/lightrace/"><img src="https://img.shields.io/pypi/v/lightrace?style=flat-square&color=ff1a1a" alt="PyPI version" /></a>
+  <a href="https://github.com/SKE-Labs/lightrace-python/stargazers"><img src="https://img.shields.io/github/stars/SKE-Labs/lightrace-python?style=flat-square" alt="GitHub stars" /></a>
+  <a href="https://github.com/SKE-Labs/lightrace-python/blob/main/LICENSE"><img src="https://img.shields.io/github/license/SKE-Labs/lightrace-python?style=flat-square" alt="License" /></a>
+</p>
+
+<p align="center">Lightweight LLM tracing SDK for Python with remote tool invocation.</p>
+
+---
 
 ## Install
 
@@ -72,6 +84,12 @@ lt.shutdown()
 ## Compatibility
 
 Lightrace server also accepts traces from Langfuse Python/JS SDKs.
+
+## Related
+
+- [Lightrace](https://github.com/SKE-Labs/lightrace) — the main platform (backend + frontend)
+- [Lightrace CLI](https://github.com/SKE-Labs/lightrace-cli) — self-host with a single command
+- [lightrace-js](https://github.com/SKE-Labs/lightrace-js) — TypeScript/JavaScript SDK
 
 ## Development
 
