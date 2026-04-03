@@ -16,7 +16,7 @@ from lightrace import Lightrace, trace
 lt = Lightrace(
     public_key="pk-lt-demo",
     secret_key="sk-lt-demo",
-    host="http://localhost:3002",
+    host="http://localhost:3000",
 )
 
 # Root trace

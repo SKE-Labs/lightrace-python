@@ -10,7 +10,7 @@ from lightrace.types import TraceEvent
 class TestBatchExporter:
     def test_enqueue_and_flush(self):
         exporter = BatchExporter(
-            host="http://localhost:3002",
+            host="http://localhost:3000",
             public_key="pk-test",
             secret_key="sk-test",
             flush_at=100,
@@ -42,7 +42,7 @@ class TestBatchExporter:
 
     def test_auto_flush_at_threshold(self):
         exporter = BatchExporter(
-            host="http://localhost:3002",
+            host="http://localhost:3000",
             public_key="pk-test",
             secret_key="sk-test",
             flush_at=2,
@@ -60,7 +60,7 @@ class TestBatchExporter:
 
     def test_auth_header_format(self):
         exporter = BatchExporter(
-            host="http://localhost:3002",
+            host="http://localhost:3000",
             public_key="pk-test",
             secret_key="sk-test",
         )

@@ -36,7 +36,7 @@ def otel_setup():
     lt = Lightrace.__new__(Lightrace)
     lt._public_key = "pk-test"
     lt._secret_key = "sk-test"
-    lt._host = "http://localhost:3002"
+    lt._host = "http://localhost:3000"
     lt._enabled = True
     lt._otel_exporter = fake
     lt._exporter = fake

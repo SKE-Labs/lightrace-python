@@ -33,7 +33,7 @@ class Lightrace:
         lt = Lightrace(
             public_key="pk-lt-demo",
             secret_key="sk-lt-demo",
-            host="http://localhost:3002",
+            host="http://localhost:3000",
         )
 
         @trace()
@@ -61,7 +61,7 @@ class Lightrace:
     ):
         self._public_key = public_key or os.environ.get("LIGHTRACE_PUBLIC_KEY", "")
         self._secret_key = secret_key or os.environ.get("LIGHTRACE_SECRET_KEY", "")
-        self._host = (host or os.environ.get("LIGHTRACE_HOST", "http://localhost:3002")).rstrip("/")
+        self._host = (host or os.environ.get("LIGHTRACE_HOST", "http://localhost:3000")).rstrip("/")
         self._enabled = enabled
         self._user_id = user_id
         self._session_id = session_id
