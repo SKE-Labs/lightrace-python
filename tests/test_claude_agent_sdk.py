@@ -29,15 +29,17 @@ class _FakeBlock:
 
 
 class AssistantMessage:
-    def __init__(self, content=None, model="claude-sonnet-4-20250514", usage=None):
+    def __init__(self, content=None, model="claude-sonnet-4-20250514", usage=None, message_id=None):
         self.content = content or []
         self.model = model
         self.usage = usage
+        self.message_id = message_id
 
 
 class UserMessage:
-    def __init__(self, content=None):
+    def __init__(self, content=None, tool_use_result=None):
         self.content = content or []
+        self.tool_use_result = tool_use_result
 
 
 class ResultMessage:
@@ -50,6 +52,7 @@ class ResultMessage:
         is_error=False,
         subtype="success",
         usage=None,
+        model_usage=None,
     ):
         self.result = result
         self.num_turns = num_turns
@@ -58,6 +61,7 @@ class ResultMessage:
         self.is_error = is_error
         self.subtype = subtype
         self.usage = usage
+        self.model_usage = model_usage
 
 
 class SystemMessage:
@@ -349,3 +353,131 @@ class TestAgentHandler:
         assert len(tool_spans) == 2
         tool_names = {s["name"] for s in tool_spans}
         assert tool_names == {"search", "read_file"}
+
+    def test_dict_blocks_without_type_field(self, otel_setup):
+        """Blocks as plain dicts without 'type' key (real SDK behavior)."""
+        exporter = otel_setup
+        handler = _make_handler(prompt="Q")
+
+        # Simulate real SDK content: plain dicts without type field
+        handler.handle(
+            AssistantMessage(
+                content=[
+                    {"text": "Let me search"},  # no type
+                    {"id": "t1", "name": "web_search", "input": {"q": "X"}},  # no type
+                    {"thinking": "I should search for X", "signature": "abc"},  # no type
+                ],
+            )
+        )
+        handler.handle(UserMessage(content=[_tool_result("t1", "Found X")]))
+        handler.handle(ResultMessage(result="Found X"))
+
+        # Should create tool span
+        tool_spans = [
+            get_span_data(s)
+            for s in exporter.get_finished_spans()
+            if (dict(s.attributes or {})).get("lightrace.observation.type") == "TOOL"
+        ]
+        assert len(tool_spans) == 1
+        assert tool_spans[0]["name"] == "web_search"
+
+        # Generation output should be wrapped in message format with type fields
+        gen_data = find_spans_by_name(exporter.get_finished_spans(), "claude-sonnet-4-20250514")[0]
+        gen_output = get_json_attr(gen_data, "lightrace.observation.output")
+        assert gen_output["role"] == "assistant"
+        content_blocks = gen_output["content"]
+        assert content_blocks[0] == {"type": "text", "text": "Let me search"}
+        assert content_blocks[1]["type"] == "tool_use"
+        assert content_blocks[1]["name"] == "web_search"
+        assert content_blocks[2] == {"type": "thinking", "thinking": "I should search for X"}
+
+    def test_generation_output_format_matches_langchain(self, otel_setup):
+        """Generation output is wrapped in {role: assistant, content: [...]}."""
+        exporter = otel_setup
+        handler = _make_handler(prompt="Q")
+
+        handler.handle(AssistantMessage(content=[_text("Hello!")]))
+        handler.handle(ResultMessage(result="Hello!"))
+
+        gen_data = find_spans_by_name(exporter.get_finished_spans(), "claude-sonnet-4-20250514")[0]
+        gen_output = get_json_attr(gen_data, "lightrace.observation.output")
+        assert gen_output["role"] == "assistant"
+        assert gen_output["content"] == [{"type": "text", "text": "Hello!"}]
+
+    def test_same_message_id_merges_into_single_generation(self, otel_setup):
+        """Multiple AssistantMessages with same message_id → one generation."""
+        exporter = otel_setup
+        handler = _make_handler(prompt="Q")
+
+        # SDK yields thinking block first, then tool_use — same message_id
+        handler.handle(
+            AssistantMessage(
+                content=[_FakeBlock("thinking", thinking="Let me think...")],
+                message_id="msg_01X",
+                usage=_usage(50, 10),
+            )
+        )
+        handler.handle(
+            AssistantMessage(
+                content=[_tool_use("t1", "search", {"q": "X"})],
+                message_id="msg_01X",
+                usage=_usage(50, 30),
+            )
+        )
+        handler.handle(UserMessage(content=[_tool_result("t1", "Found X")]))
+        handler.handle(ResultMessage(result="Found X"))
+
+        gen_spans = find_spans_by_name(exporter.get_finished_spans(), "claude-sonnet-4-20250514")
+        # Should be ONE generation span, not two
+        assert len(gen_spans) == 1
+
+        # Output should contain both thinking and tool_use blocks
+        gen_output = get_json_attr(gen_spans[0], "lightrace.observation.output")
+        assert gen_output["role"] == "assistant"
+        types = [b["type"] for b in gen_output["content"]]
+        assert "thinking" in types
+        assert "tool_use" in types
+
+    def test_tool_use_result_fallback(self, otel_setup):
+        """Tool result from UserMessage.tool_use_result used as fallback."""
+        exporter = otel_setup
+        handler = _make_handler(prompt="Q")
+
+        handler.handle(AssistantMessage(content=[_tool_use("t1", "read_file")]))
+        # ToolResultBlock has no content, but tool_use_result has the string
+        handler.handle(
+            UserMessage(
+                content=[_FakeBlock("tool_result", tool_use_id="t1")],
+                tool_use_result="file contents here",
+            )
+        )
+        handler.handle(ResultMessage(result="Done"))
+
+        tool_data = find_spans_by_name(exporter.get_finished_spans(), "read_file")[0]
+        tool_output = tool_data["attributes"].get("lightrace.observation.output", "")
+        assert "file contents here" in tool_output
+
+    def test_model_usage_in_result_output(self, otel_setup):
+        """ResultMessage.model_usage is captured in root span output."""
+        exporter = otel_setup
+        handler = _make_handler(prompt="Q")
+
+        handler.handle(AssistantMessage(content=[_text("A")]))
+        handler.handle(
+            ResultMessage(
+                result="A",
+                model_usage={
+                    "claude-sonnet-4-6": {
+                        "inputTokens": 100,
+                        "outputTokens": 50,
+                        "costUSD": 0.015,
+                    }
+                },
+            )
+        )
+
+        all_data = [get_span_data(s) for s in exporter.get_finished_spans()]
+        root = next(s for s in all_data if s["attributes"].get("lightrace.internal.as_root"))
+        output = get_json_attr(root, "lightrace.trace.output")
+        assert "model_usage" in output
+        assert output["model_usage"]["claude-sonnet-4-6"]["costUSD"] == 0.015

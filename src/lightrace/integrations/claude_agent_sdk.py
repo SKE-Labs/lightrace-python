@@ -59,7 +59,15 @@ class LightraceAgentHandler(TracingMixin):
         self._prompt = prompt
         self._agent_run_id: str | None = None
         self._tool_run_ids: dict[str, str] = {}  # tool_use_id → run_id
-        self._turn_count = 0
+        self._init_tools: list[str] | None = None
+        self._init_model: str | None = None
+
+        # Generation span accumulation — SDK yields multiple AssistantMessages
+        # per turn (thinking + tool_use) sharing the same message_id.
+        self._current_gen_run_id: str | None = None
+        self._current_message_id: str | None = None
+        self._current_output_blocks: list[dict[str, Any]] = []
+        self._current_usage: dict[str, int] | None = None
 
     # ── Public API ───────────────────────────────────────────────────
 
@@ -77,58 +85,104 @@ class LightraceAgentHandler(TracingMixin):
                 self._on_user(message)
             elif cls_name == "ResultMessage":
                 self._on_result(message)
+            elif cls_name == "SystemMessage":
+                self._on_system(message)
         except Exception:
             logger.exception("Error handling %s", cls_name)
 
     # ── Message handlers ─────────────────────────────────────────────
+
+    def _on_system(self, msg: Any) -> None:
+        """Handle a SystemMessage — capture tools and model from init."""
+        subtype = self._get_field(msg, "subtype", None)
+        if subtype == "init":
+            # Tools/model are nested in a `data` dict
+            data = self._get_field(msg, "data", None)
+            source = data if isinstance(data, dict) else msg
+
+            tools = (
+                source.get("tools") if isinstance(source, dict) else getattr(source, "tools", None)
+            )
+            if tools:
+                self._init_tools = list(tools)
+
+            model = (
+                source.get("model") if isinstance(source, dict) else getattr(source, "model", None)
+            )
+            if model:
+                self._init_model = str(model)
 
     def _on_assistant(self, msg: Any) -> None:
         """Handle an AssistantMessage — create generation + tool spans."""
         # Start root agent span on first message
         if self._agent_run_id is None:
             self._agent_run_id = generate_id()
+            input_data: dict[str, Any] = {"prompt": self._prompt}
+            if self._init_tools:
+                input_data["tools"] = self._init_tools
+            if self._init_model:
+                input_data["model"] = self._init_model
             self._create_obs(
                 run_id=self._agent_run_id,
                 parent_run_id=None,
                 obs_type="agent",
                 name=self._trace_name or "claude-agent",
-                input_data=self._prompt,
+                input_data=input_data,
             )
 
-        self._turn_count += 1
-        model = getattr(msg, "model", None)
+        message_id = getattr(msg, "message_id", None)
 
-        # Create a generation span for this turn
-        gen_run_id = generate_id()
+        # SDK yields multiple AssistantMessages per turn sharing the same
+        # message_id (e.g. thinking block, then tool_use block).  Accumulate
+        # content blocks into a single generation span.
+        if (
+            message_id
+            and message_id == self._current_message_id
+            and self._current_gen_run_id is not None
+        ):
+            self._process_content_blocks(msg)
+            return
+
+        # New turn — flush any pending generation from the previous turn.
+        self._flush_generation()
+
+        model = getattr(msg, "model", None)
+        self._current_message_id = message_id
+        self._current_gen_run_id = generate_id()
+        self._current_output_blocks = []
+        self._current_usage = None
+
         self._create_obs(
-            run_id=gen_run_id,
+            run_id=self._current_gen_run_id,
             parent_run_id=self._agent_run_id,
             obs_type="generation",
             name=str(model or "claude"),
             model=str(model) if model else None,
         )
 
-        # Extract content blocks
+        self._process_content_blocks(msg)
+
+    def _process_content_blocks(self, msg: Any) -> None:
+        """Extract content blocks from an AssistantMessage."""
         content = getattr(msg, "content", []) or []
-        output_blocks: list[dict[str, Any]] = []
 
         for block in content:
-            block_type = getattr(block, "type", None)
+            block_type, has_text, has_tool, has_thinking = self._classify_block(block)
 
-            if block_type == "text":
-                text = getattr(block, "text", "")
-                output_blocks.append({"type": "text", "text": text})
+            if block_type == "text" or (block_type is None and has_text):
+                text = self._get_field(block, "text", "")
+                self._current_output_blocks.append({"type": "text", "text": text})
 
-            elif block_type == "tool_use":
-                tool_id = getattr(block, "id", "")
-                tool_name = getattr(block, "name", "tool")
-                tool_input = getattr(block, "input", {})
-                output_blocks.append(
+            elif block_type == "tool_use" or (block_type is None and has_tool):
+                tool_id = self._get_field(block, "id", "")
+                tool_name = self._get_field(block, "name", "tool")
+                tool_input = self._get_field(block, "input", {})
+                self._current_output_blocks.append(
                     {
                         "type": "tool_use",
                         "id": tool_id,
                         "name": tool_name,
-                        "input": json_serializable(tool_input),
+                        "input": tool_input,
                     }
                 )
 
@@ -142,29 +196,59 @@ class LightraceAgentHandler(TracingMixin):
                     name=tool_name,
                     input_data=tool_input,
                 )
-            else:
-                output_blocks.append(json_serializable(block))
 
-        # End the generation span (the LLM call itself is complete)
-        usage = normalize_usage(msg.usage) if getattr(msg, "usage", None) else None
-        self._end_obs(gen_run_id, output=output_blocks, usage=usage)
+            elif block_type == "thinking" or (block_type is None and has_thinking):
+                thinking = self._get_field(block, "thinking", "")
+                self._current_output_blocks.append({"type": "thinking", "thinking": thinking})
+
+            else:
+                self._current_output_blocks.append(json_serializable(block))
+
+        # Keep the latest usage from this message (last one wins)
+        raw_usage = getattr(msg, "usage", None)
+        if raw_usage:
+            self._current_usage = normalize_usage(raw_usage)
+
+    def _flush_generation(self) -> None:
+        """End the current pending generation span with accumulated blocks."""
+        if self._current_gen_run_id is None:
+            return
+        output: dict[str, Any] = {
+            "role": "assistant",
+            "content": self._current_output_blocks,
+        }
+        self._end_obs(
+            self._current_gen_run_id,
+            output=output,
+            usage=self._current_usage,
+        )
+        self._current_gen_run_id = None
+        self._current_message_id = None
+        self._current_output_blocks = []
+        self._current_usage = None
 
     def _on_user(self, msg: Any) -> None:
         """Handle a UserMessage — end tool spans with results."""
+        self._flush_generation()
+
         content = getattr(msg, "content", None)
+        # tool_use_result has the actual result string as fallback
+        fallback = getattr(msg, "tool_use_result", None)
 
         if isinstance(content, list):
             for block in content:
-                self._try_end_tool(block)
+                self._try_end_tool(block, fallback_output=fallback)
         elif isinstance(content, str) and self._tool_run_ids:
             # Single string result — end the most recent pending tool
-            tool_use_id, tool_run_id = self._tool_run_ids.popitem()
+            _, tool_run_id = self._tool_run_ids.popitem()
             self._end_obs(tool_run_id, output=content)
 
     def _on_result(self, msg: Any) -> None:
         """Handle a ResultMessage — finalize the root agent span."""
+        self._flush_generation()
+
         # End any remaining tool spans
-        for tool_use_id, tool_run_id in list(self._tool_run_ids.items()):
+        for _, tool_run_id in list(self._tool_run_ids.items()):
             self._end_obs(tool_run_id)
         self._tool_run_ids.clear()
 
@@ -189,6 +273,9 @@ class LightraceAgentHandler(TracingMixin):
         subtype = getattr(msg, "subtype", None)
         if subtype:
             output["subtype"] = subtype
+        model_usage = getattr(msg, "model_usage", None)
+        if model_usage:
+            output["model_usage"] = json_serializable(model_usage)
 
         usage = normalize_usage(msg.usage) if getattr(msg, "usage", None) else None
 
@@ -205,13 +292,37 @@ class LightraceAgentHandler(TracingMixin):
             self._end_obs(self._agent_run_id, output=output, usage=usage)
 
         self._agent_run_id = None
-        self._turn_count = 0
 
     # ── Helpers ───────────────────────────────────────────────────────
 
-    def _try_end_tool(self, block: Any) -> None:
+    @staticmethod
+    def _get_field(block: Any, field: str, default: Any = None) -> Any:
+        if isinstance(block, dict):
+            return block.get(field, default)
+        return getattr(block, field, default)
+
+    @staticmethod
+    def _classify_block(
+        block: Any,
+    ) -> tuple[str | None, bool, bool, bool]:
+        """Classify a content block by type field or field presence.
+
+        Returns (block_type, has_text, has_tool, has_thinking).
+        """
+        if isinstance(block, dict):
+            block_type = block.get("type")
+            has_text = "text" in block and "id" not in block
+            has_tool = "id" in block and "name" in block and "input" in block
+            has_thinking = "thinking" in block
+        else:
+            block_type = getattr(block, "type", None)
+            has_text = hasattr(block, "text") and not hasattr(block, "id")
+            has_tool = hasattr(block, "id") and hasattr(block, "name") and hasattr(block, "input")
+            has_thinking = hasattr(block, "thinking")
+        return block_type, has_text, has_tool, has_thinking
+
+    def _try_end_tool(self, block: Any, fallback_output: Any = None) -> None:
         """Try to match a content block to a pending tool span and end it."""
-        # ToolResultBlock or dict with tool_use_id
         tool_use_id = None
         output: Any = None
 
@@ -222,6 +333,10 @@ class LightraceAgentHandler(TracingMixin):
             tool_use_id = block.get("tool_use_id")
             output = block.get("content") or block.get("output")
 
+        # Use fallback from UserMessage.tool_use_result when block has no output
+        if output is None and fallback_output is not None:
+            output = fallback_output
+
         if tool_use_id and tool_use_id in self._tool_run_ids:
             tool_run_id = self._tool_run_ids.pop(tool_use_id)
             is_error = getattr(block, "is_error", False)
@@ -231,12 +346,12 @@ class LightraceAgentHandler(TracingMixin):
             if is_error:
                 self._end_obs(
                     tool_run_id,
-                    output=json_serializable(output),
+                    output=output,
                     level="ERROR",
                     status_message=str(output),
                 )
             else:
-                self._end_obs(tool_run_id, output=json_serializable(output))
+                self._end_obs(tool_run_id, output=output)
 
 
 async def traced_query(
@@ -251,7 +366,7 @@ async def traced_query(
     metadata: dict[str, Any] | None = None,
     tags: list[str] | None = None,
 ) -> AsyncIterator[Any]:
-    """Drop-in replacement for ``claude_agent_sdk.query()`` with Lightrace tracing.
+    """Drop-in replacement for ``claude_agent_sdk.query()`` with tracing.
 
     Wraps the agent message stream, emitting OTel spans for each generation
     and tool call. Messages are yielded through unchanged.
@@ -260,7 +375,7 @@ async def traced_query(
         prompt: The prompt to send to the agent.
         options: ``ClaudeAgentOptions`` to pass through.
         transport: Optional transport override.
-        client: A ``Lightrace`` instance (or *None* to use the global exporter).
+        client: A ``Lightrace`` instance (or *None* for the global exporter).
         user_id: User ID to attach to the trace.
         session_id: Session ID to attach to the trace.
         trace_name: Name for the root trace span.
