@@ -167,10 +167,12 @@ class TestTraceDecorator:
         spans = exporter.get_finished_spans()
         assert len(spans) == 2
 
-        # Child span should be a child of parent (same trace)
+        # Child span should be a child of parent (same trace + parent_span_id)
         child_span = next(s for s in spans if s.name == "child")
         parent_span = next(s for s in spans if s.name == "parent")
         assert child_span.context.trace_id == parent_span.context.trace_id
+        assert child_span.parent is not None
+        assert child_span.parent.span_id == parent_span.context.span_id
 
     def test_invalid_type_raises(self):
         with pytest.raises(ValueError, match="Invalid trace type"):
@@ -235,10 +237,12 @@ class TestTraceDecorator:
         gen("question")
         spans = exporter.get_finished_spans()
         attrs = _get_attrs(spans[0])
-        usage = attrs.get("lightrace.observation.usage_details", "")
-        assert '"promptTokens": 10' in usage
-        assert '"completionTokens": 50' in usage
-        assert '"totalTokens": 60' in usage
+        import json
+
+        usage = json.loads(attrs.get("lightrace.observation.usage_details", "{}"))
+        assert usage["promptTokens"] == 10
+        assert usage["completionTokens"] == 50
+        assert usage["totalTokens"] == 60
 
 
 class TestTraceDecoratorAsync:
@@ -299,7 +303,50 @@ class TestTraceDecoratorAsync:
         await gen("hi")
         spans = exporter.get_finished_spans()
         attrs = _get_attrs(spans[0])
-        usage = attrs.get("lightrace.observation.usage_details", "")
-        assert '"promptTokens": 5' in usage
-        assert '"completionTokens": 20' in usage
-        assert '"totalTokens": 25' in usage
+        import json
+
+        usage = json.loads(attrs.get("lightrace.observation.usage_details", "{}"))
+        assert usage["promptTokens"] == 5
+        assert usage["completionTokens"] == 20
+        assert usage["totalTokens"] == 25
+
+
+class TestEdgeCases:
+    def test_none_return_value(self, otel_setup):
+        """Traced function returning None should not crash."""
+        exporter = otel_setup
+
+        @trace()
+        def returns_none():
+            return None
+
+        result = returns_none()
+        assert result is None
+
+        spans = exporter.get_finished_spans()
+        assert len(spans) == 1
+
+    @pytest.mark.asyncio
+    async def test_concurrent_async_traces(self, otel_setup):
+        """Two concurrent traced async functions get separate trace_ids."""
+        import asyncio
+
+        exporter = otel_setup
+
+        @trace()
+        async def task_a():
+            await asyncio.sleep(0.01)
+            return "a"
+
+        @trace()
+        async def task_b():
+            await asyncio.sleep(0.01)
+            return "b"
+
+        results = await asyncio.gather(task_a(), task_b())
+        assert set(results) == {"a", "b"}
+
+        spans = exporter.get_finished_spans()
+        assert len(spans) == 2
+        trace_ids = {s.context.trace_id for s in spans}
+        assert len(trace_ids) == 2  # Each trace should have its own trace_id

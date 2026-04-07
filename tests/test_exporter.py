@@ -70,3 +70,36 @@ class TestBatchExporter:
         expected = "Basic " + base64.b64encode(b"pk-test:sk-test").decode()
         assert exporter._auth_header == expected
         exporter.shutdown()
+
+    def test_flush_empty_queue(self):
+        """Flushing an empty queue should not crash or make HTTP calls."""
+        exporter = BatchExporter(
+            host="http://localhost:3000",
+            public_key="pk-test",
+            secret_key="sk-test",
+            flush_at=100,
+            flush_interval=9999,
+        )
+
+        with patch.object(exporter, "_client") as mock_client:
+            exporter.flush()
+            mock_client.post.assert_not_called()
+
+        exporter.shutdown()
+
+    def test_shutdown_flushes_remaining(self):
+        """Shutdown should flush any remaining events in the queue."""
+        exporter = BatchExporter(
+            host="http://localhost:3000",
+            public_key="pk-test",
+            secret_key="sk-test",
+            flush_at=100,
+            flush_interval=9999,
+        )
+
+        event = TraceEvent("1", "trace-create", {"id": "t1"})
+        exporter.enqueue(event)
+
+        with patch.object(exporter, "_do_flush") as mock_flush:
+            exporter.shutdown()
+            mock_flush.assert_called()

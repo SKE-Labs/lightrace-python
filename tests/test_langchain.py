@@ -156,7 +156,12 @@ class TestLLMCallbacks:
         llm_attrs = dict(llm_span.attributes or {})
         assert llm_attrs.get("lightrace.observation.type") == "GENERATION"
         assert llm_attrs.get("lightrace.observation.model") == "gpt-4o"
-        assert "promptTokens" in (llm_attrs.get("lightrace.observation.usage_details") or "")
+        import json
+
+        usage = json.loads(llm_attrs.get("lightrace.observation.usage_details", "{}"))
+        assert usage["promptTokens"] == 10
+        assert usage["completionTokens"] == 20
+        assert usage["totalTokens"] == 30
 
     def test_chat_model_start_with_messages(self, otel_capture):
         handler = _make_handler()
