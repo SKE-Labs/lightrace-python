@@ -43,6 +43,14 @@ class Lightrace:
 
         lt.flush()
         lt.shutdown()
+
+    Docker note:
+        When the Lightrace backend runs in Docker, set ``dev_server_host``
+        (or env var ``LIGHTRACE_DEV_SERVER_HOST``) so the backend container
+        can reach the SDK's dev server for tool re-invocation::
+
+            lt = Lightrace(..., dev_server_host="host.docker.internal")
+            # or: LIGHTRACE_DEV_SERVER_HOST=host.docker.internal python app.py
     """
 
     _instance: Lightrace | None = None
