@@ -165,9 +165,11 @@ class DevServer:
         ready = threading.Event()
         assigned_port_holder: list[int] = []
 
+        # Bind to 0.0.0.0 when callback_host is not localhost (e.g. Docker)
+        bind_host = "127.0.0.1" if self._callback_host in ("127.0.0.1", "localhost") else "0.0.0.0"
         config = uvicorn.Config(
             app,
-            host="127.0.0.1",
+            host=bind_host,
             port=self._port,
             log_level="warning",
         )
