@@ -9,6 +9,7 @@ Uses FastAPI + uvicorn for production-grade async HTTP handling.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import threading
 import time
@@ -85,16 +86,32 @@ def _create_app(public_key: str) -> FastAPI:
         input_data = req.input
         start = time.monotonic()
 
+        # Smart dispatch: spread kwargs when input keys match function parameter names
+        spread = False
+        if isinstance(input_data, dict):
+            try:
+                sig = inspect.signature(func)
+                param_names = {
+                    p.name
+                    for p in sig.parameters.values()
+                    if p.kind
+                    not in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD)
+                }
+                # Spread if the input dict keys are a subset of the function's param names
+                spread = len(param_names) > 0 and set(input_data.keys()).issubset(param_names)
+            except (ValueError, TypeError):
+                spread = False
+
         try:
             if asyncio.iscoroutinefunction(func):
-                if isinstance(input_data, dict):
+                if spread:
                     result = await func(**input_data)
                 elif input_data is not None:
                     result = await func(input_data)
                 else:
                     result = await func()
             else:
-                if isinstance(input_data, dict):
+                if spread:
                     result = await asyncio.to_thread(func, **input_data)
                 elif input_data is not None:
                     result = await asyncio.to_thread(func, input_data)
@@ -128,9 +145,10 @@ def _create_app(public_key: str) -> FastAPI:
 class DevServer:
     """Lightweight HTTP server that accepts tool invocation from the dashboard."""
 
-    def __init__(self, port: int = 0, public_key: str = ""):
+    def __init__(self, port: int = 0, public_key: str = "", callback_host: str = "127.0.0.1"):
         self._port = port
         self._public_key = public_key
+        self._callback_host = callback_host
         self._thread: threading.Thread | None = None
         self._assigned_port: int | None = None
         self._server: Any = None
@@ -205,4 +223,4 @@ class DevServer:
     def callback_url(self) -> str | None:
         if self._assigned_port is None:
             return None
-        return f"http://127.0.0.1:{self._assigned_port}"
+        return f"http://{self._callback_host}:{self._assigned_port}"

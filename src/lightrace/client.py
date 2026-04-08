@@ -18,6 +18,7 @@ from .trace import (
     _current_trace_id,
     _get_tool_registry,
     _set_client_defaults,
+    _set_on_tool_registered,
     _set_otel_exporter,
     _tool_registry,
 )
@@ -58,6 +59,7 @@ class Lightrace:
         session_id: str | None = None,
         dev_server: bool = True,
         dev_server_port: int = 0,
+        dev_server_host: str | None = None,
     ):
         self._public_key = public_key or os.environ.get("LIGHTRACE_PUBLIC_KEY", "")
         self._secret_key = secret_key or os.environ.get("LIGHTRACE_SECRET_KEY", "")
@@ -69,6 +71,9 @@ class Lightrace:
         self._dev_server: DevServer | None = None
         self._dev_server_enabled = dev_server
         self._dev_server_port = dev_server_port
+        self._dev_server_host = dev_server_host or os.environ.get(
+            "LIGHTRACE_DEV_SERVER_HOST", "127.0.0.1"
+        )
 
         if not enabled:
             logger.info("Lightrace disabled — no events will be sent")
@@ -120,16 +125,30 @@ class Lightrace:
         self._dev_server = DevServer(
             port=self._dev_server_port,
             public_key=self._public_key,
+            callback_host=self._dev_server_host,
         )
+        self._pending_registration: threading.Timer | None = None
         try:
             port = self._dev_server.start()
             logger.info("Dev server listening on http://127.0.0.1:%d", port)
             self._register_tools_http()
+
+            # Re-register when new tools are added after init (debounced)
+            def _on_new_tool(name: str) -> None:
+                logger.debug("New tool registered: %s — scheduling re-registration", name)
+                if self._pending_registration is not None:
+                    self._pending_registration.cancel()
+                timer = threading.Timer(0.2, self._register_tools_http)
+                timer.daemon = True
+                timer.start()
+                self._pending_registration = timer
+
+            _set_on_tool_registered(_on_new_tool)
         except Exception as e:
             logger.error("Failed to start dev server: %s", e)
 
     def _register_tools_http(self) -> None:
-        """Register tool definitions with the Lightrace backend via HTTP (fire-and-forget)."""
+        """Register tool definitions with the Lightrace backend via HTTP with retry."""
         registry = _get_tool_registry()
         if not registry:
             return
@@ -149,19 +168,42 @@ class Lightrace:
 
         auth = base64.b64encode(f"{self._public_key}:{self._secret_key}".encode()).decode()
         host = self._host
+        max_retries = 3
 
         def _do_register() -> None:
-            try:
-                resp = httpx.post(
-                    f"{host}/api/public/tools/register",
-                    json={"callbackUrl": callback_url, "tools": tools},
-                    headers={"Authorization": f"Basic {auth}"},
-                    timeout=5.0,
-                )
-                if resp.status_code >= 400:
-                    logger.warning("Tool registration returned %d", resp.status_code)
-            except Exception as e:
-                logger.error("Failed to register tools: %s", e)
+            import time
+
+            for attempt in range(max_retries):
+                try:
+                    resp = httpx.post(
+                        f"{host}/api/public/tools/register",
+                        json={"callbackUrl": callback_url, "tools": tools},
+                        headers={"Authorization": f"Basic {auth}"},
+                        timeout=5.0,
+                    )
+                    if resp.status_code < 400:
+                        logger.info(
+                            "Registered %d tool(s): %s",
+                            len(tools),
+                            ", ".join(t["name"] for t in tools),
+                        )
+                        return
+                    logger.warning(
+                        "Tool registration returned %d (attempt %d/%d)",
+                        resp.status_code,
+                        attempt + 1,
+                        max_retries,
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "Tool registration failed (attempt %d/%d): %s",
+                        attempt + 1,
+                        max_retries,
+                        e,
+                    )
+                if attempt < max_retries - 1:
+                    time.sleep(2**attempt)
+            logger.error("Tool registration failed after %d attempts", max_retries)
 
         threading.Thread(target=_do_register, daemon=True, name="lightrace-register").start()
 
@@ -225,6 +267,10 @@ class Lightrace:
 
     def shutdown(self) -> None:
         """Flush and shut down the client."""
+        _set_on_tool_registered(None)
+        if hasattr(self, "_pending_registration") and self._pending_registration is not None:
+            self._pending_registration.cancel()
+            self._pending_registration = None
         if self._dev_server is not None:
             self._dev_server.stop()
             self._dev_server = None

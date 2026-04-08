@@ -28,6 +28,7 @@ _current_observation_id: ContextVar[str | None] = ContextVar(
 # Global references (set by Client on init)
 _otel_exporter: Any = None  # LightraceOtelExporter instance
 _tool_registry: dict[str, dict[str, Any]] = {}
+_on_tool_registered: Callable[[str], None] | None = None
 
 # Client defaults
 _client_defaults: dict[str, str | None] = {"user_id": None, "session_id": None}
@@ -45,6 +46,11 @@ def _set_client_defaults(defaults: dict[str, str | None]) -> None:
 
 def _get_tool_registry() -> dict[str, dict[str, Any]]:
     return _tool_registry
+
+
+def _set_on_tool_registered(callback: Callable[[str], None] | None) -> None:
+    global _on_tool_registered
+    _on_tool_registered = callback
 
 
 VALID_TYPES = {None, "span", "generation", "event", "tool", "chain"}
@@ -86,6 +92,8 @@ def trace(
                 "input_schema": build_json_schema(func),
                 "description": None,
             }
+            if _on_tool_registered is not None:
+                _on_tool_registered(obs_name)
 
         if asyncio.iscoroutinefunction(func):
 
