@@ -7,3 +7,11 @@ repos:
         types_or: [python, pyi]
       - id: ruff-format
         types_or: [python, pyi]
+  - repo: local
+    hooks:
+      - id: mypy
+        name: mypy
+        entry: .venv/bin/mypy src/lightrace --no-error-summary
+        language: system
+        types: [python]
+        pass_filenames: false

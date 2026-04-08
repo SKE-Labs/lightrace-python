@@ -182,10 +182,11 @@ class Lightrace:
                         timeout=5.0,
                     )
                     if resp.status_code < 400:
+                        tool_names = [str(t["name"]) for t in tools]
                         logger.info(
                             "Registered %d tool(s): %s",
                             len(tools),
-                            ", ".join(t["name"] for t in tools),
+                            ", ".join(tool_names),
                         )
                         return
                     logger.warning(
