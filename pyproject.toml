@@ -7,14 +7,14 @@ name = "lightrace"
 version = "1.0.7"
 description = "Agentic development kit — LLM tracing, tool management, and agent primitives"
 readme = "README.md"
-license = "MIT"
+license = "Apache-2.0"
 requires-python = ">=3.10"
 authors = [{ name = "Ganchuluun Narantsatsralt", email = "tsatsralt@swifttech.cloud"}]
 keywords = ["llm", "tracing", "observability", "opentelemetry", "agent", "adk", "tool-management"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
-    "License :: OSI Approved :: MIT License",
+    "License :: OSI Approved :: Apache Software License",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
