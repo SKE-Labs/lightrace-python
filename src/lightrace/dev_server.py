@@ -23,7 +23,8 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request as StarletteRequest
 from starlette.responses import Response as StarletteResponse
 
-from .trace import _get_tool_registry
+from .context import capture_context, restore_context
+from .trace import _get_replay_handler_registry, _get_tool_registry
 from .utils import json_serializable
 
 logger = logging.getLogger("lightrace")
@@ -46,6 +47,15 @@ class _BodySizeLimitMiddleware(BaseHTTPMiddleware):
 class InvokeRequest(BaseModel):
     tool: str
     input: Any = None
+    context: dict[str, Any] | None = None
+
+
+class ReplayRequest(BaseModel):
+    messages: list[dict[str, Any]]
+    tools: list[dict[str, Any]] | None = None
+    model: str | None = None
+    system: str | list[dict[str, Any]] | None = None
+    context: dict[str, Any] | None = None
 
 
 def _api_response(code: int, message: str, response: Any = None) -> JSONResponse:
@@ -85,6 +95,12 @@ def _create_app(public_key: str) -> FastAPI:
         func = tool_info["func"]
         input_data = req.input
         start = time.monotonic()
+
+        # Restore captured context variables (e.g., user_id, thread_id)
+        # Save old values so we can reset after invocation to prevent leaks
+        saved_context = capture_context() if req.context else None
+        if req.context:
+            restore_context(req.context)
 
         # Smart dispatch: spread kwargs when input keys match function parameter names
         spread = False
@@ -138,6 +154,93 @@ def _create_app(public_key: str) -> FastAPI:
                     "durationMs": duration_ms,
                 },
             )
+        finally:
+            if saved_context is not None:
+                restore_context(saved_context)
+
+    @app.post("/replay")
+    async def replay(req: ReplayRequest, request: Request) -> JSONResponse:
+        if public_key:
+            auth = request.headers.get("Authorization", "")
+            if auth != f"Bearer {public_key}":
+                return _api_response(401, "Unauthorized")
+
+        handler_registry = _get_replay_handler_registry()
+        handler = handler_registry.get("default")
+        if handler is None:
+            return _api_response(
+                400,
+                "No replay handler registered. "
+                "Call lt.register_replay_handler(fn) or lt.register_graph(agent).",
+            )
+
+        saved_context = capture_context() if req.context else None
+        if req.context:
+            restore_context(req.context)
+
+        start = time.monotonic()
+        try:
+            # Check if handler is a LangGraph compiled graph (has ainvoke/astream)
+            if hasattr(handler, "ainvoke") and hasattr(handler, "astream"):
+                # LangGraph path: invoke the graph with the modified messages
+                from langchain_core.messages import (
+                    AIMessage,
+                    HumanMessage,
+                    SystemMessage,
+                    ToolMessage,
+                )
+
+                def _to_langchain_msg(m: dict[str, Any]) -> Any:
+                    role = m.get("role", "")
+                    content = m.get("content", "")
+                    if role == "user":
+                        return HumanMessage(content=content)
+                    elif role == "assistant":
+                        return AIMessage(
+                            content=content,
+                            tool_calls=m.get("tool_calls", []),
+                        )
+                    elif role == "tool":
+                        return ToolMessage(
+                            content=content,
+                            tool_call_id=m.get("tool_call_id", ""),
+                            name=m.get("name", ""),
+                        )
+                    elif role == "system":
+                        return SystemMessage(content=content)
+                    logger.warning("Unknown message role %r — treating as user", role)
+                    return HumanMessage(content=content)
+
+                lc_messages = [_to_langchain_msg(m) for m in req.messages]
+                result = await handler.ainvoke({"messages": lc_messages})
+                output = json_serializable(result)
+            elif asyncio.iscoroutinefunction(handler):
+                # Generic async handler
+                output = await handler(req.messages, req.tools, req.model, req.system)
+                output = json_serializable(output)
+            else:
+                # Generic sync handler
+                output = await asyncio.to_thread(
+                    handler, req.messages, req.tools, req.model, req.system
+                )
+                output = json_serializable(output)
+
+            duration_ms = round((time.monotonic() - start) * 1000)
+            return _api_response(
+                200,
+                "OK",
+                {"output": output, "durationMs": duration_ms},
+            )
+        except Exception as e:
+            duration_ms = round((time.monotonic() - start) * 1000)
+            return _api_response(
+                200,
+                "OK",
+                {"output": None, "error": str(e), "durationMs": duration_ms},
+            )
+        finally:
+            if saved_context is not None:
+                restore_context(saved_context)
 
     return app
 

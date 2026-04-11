@@ -38,6 +38,10 @@ OBSERVATION_MODEL_PARAMETERS = "lightrace.observation.model_parameters"
 OBSERVATION_USAGE_DETAILS = "lightrace.observation.usage_details"
 OBSERVATION_COST_DETAILS = "lightrace.observation.cost_details"
 
+GRAPH_THREAD_ID = "lightrace.graph.thread_id"
+GRAPH_CHECKPOINT_ID = "lightrace.graph.checkpoint_id"
+CHECKPOINT_STATE = "lightrace.checkpoint.state"
+
 RELEASE = "lightrace.release"
 VERSION = "lightrace.version"
 AS_ROOT = "lightrace.internal.as_root"

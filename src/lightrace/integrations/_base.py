@@ -239,8 +239,26 @@ class TracingMixin:
                 if ctx:
                     merged_metadata = {**(merged_metadata or {}), "__lightrace_context": ctx}
 
+            # Auto-capture checkpoint state for GENERATION observations
+            # The input to a generation IS the full agent state (messages + tools + model)
+            if obs_type == "generation" and input_data is not None:
+                span.set_attribute(
+                    attrs.CHECKPOINT_STATE,
+                    attrs._safe_json(json_serializable(input_data)),
+                )
+
             if merged_metadata:
                 span.set_attribute(attrs.OBSERVATION_METADATA, attrs._safe_json(merged_metadata))
+
+            # Emit graph-level attributes for checkpoint-based replay
+            if self._configurable:
+                if "thread_id" in self._configurable:
+                    span.set_attribute(attrs.GRAPH_THREAD_ID, str(self._configurable["thread_id"]))
+                if "checkpoint_id" in self._configurable:
+                    span.set_attribute(
+                        attrs.GRAPH_CHECKPOINT_ID, str(self._configurable["checkpoint_id"])
+                    )
+
             if model:
                 span.set_attribute(attrs.OBSERVATION_MODEL, model)
             if model_parameters:

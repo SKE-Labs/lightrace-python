@@ -28,6 +28,7 @@ _current_observation_id: ContextVar[str | None] = ContextVar(
 # Global references (set by Client on init)
 _otel_exporter: Any = None  # LightraceOtelExporter instance
 _tool_registry: dict[str, dict[str, Any]] = {}
+_replay_handler_registry: dict[str, Any] = {}
 _on_tool_registered: Callable[[str], None] | None = None
 
 # Client defaults
@@ -46,6 +47,10 @@ def _set_client_defaults(defaults: dict[str, str | None]) -> None:
 
 def _get_tool_registry() -> dict[str, dict[str, Any]]:
     return _tool_registry
+
+
+def _get_replay_handler_registry() -> dict[str, Any]:
+    return _replay_handler_registry
 
 
 def _set_on_tool_registered(callback: Callable[[str], None] | None) -> None:

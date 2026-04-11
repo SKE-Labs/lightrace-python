@@ -17,6 +17,7 @@ from .trace import (
     _current_observation_id,
     _current_trace_id,
     _get_tool_registry,
+    _replay_handler_registry,
     _set_client_defaults,
     _set_on_tool_registered,
     _set_otel_exporter,
@@ -174,6 +175,10 @@ class Lightrace:
             for name, info in registry.items()
         ]
 
+        capabilities: dict[str, Any] | None = None
+        if _replay_handler_registry:
+            capabilities = {"replay": True}
+
         auth = base64.b64encode(f"{self._public_key}:{self._secret_key}".encode()).decode()
         host = self._host
         max_retries = 3
@@ -181,11 +186,15 @@ class Lightrace:
         def _do_register() -> None:
             import time
 
+            payload: dict[str, Any] = {"callbackUrl": callback_url, "tools": tools}
+            if capabilities:
+                payload["capabilities"] = capabilities
+
             for attempt in range(max_retries):
                 try:
                     resp = httpx.post(
                         f"{host}/api/public/tools/register",
-                        json={"callbackUrl": callback_url, "tools": tools},
+                        json=payload,
                         headers={"Authorization": f"Basic {auth}"},
                         timeout=5.0,
                     )
@@ -265,6 +274,27 @@ class Lightrace:
                 logger.warning("Cannot register tool %r — not a callable or BaseTool", t)
 
         if _tool_registry and self._enabled:
+            self._register_tools_http()
+
+    def register_replay_handler(self, handler: Any, *, name: str = "default") -> None:
+        """Register a replay handler for fork from the dashboard.
+
+        The handler is an async callable that accepts (messages, tools, model, system)
+        and returns the LLM continuation. This enables framework-agnostic replay.
+        """
+        _replay_handler_registry[name] = handler
+        logger.info("Registered replay handler %r", name)
+        if self._enabled:
+            self._register_tools_http()
+
+    def register_graph(self, graph: Any, *, name: str = "default") -> None:
+        """Register a compiled LangGraph for replay/fork from the dashboard.
+
+        Convenience method that auto-creates a replay handler from the graph.
+        """
+        _replay_handler_registry[name] = graph
+        logger.info("Registered graph %r for replay", name)
+        if self._enabled:
             self._register_tools_http()
 
     # ── Flush / shutdown ──────────────────────────────────────────────
