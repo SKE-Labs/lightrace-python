@@ -8,8 +8,12 @@ import urllib.error
 import urllib.request
 from unittest.mock import AsyncMock, MagicMock
 
+import pytest
+
 from lightrace.dev_server import DevServer
 from lightrace.trace import _replay_handler_registry, _tool_registry
+
+langchain_core = pytest.importorskip("langchain_core")
 
 
 def _request(port, path, method="GET", body=None, headers=None):

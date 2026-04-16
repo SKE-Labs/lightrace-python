@@ -534,7 +534,7 @@ async def fork_graph(
         if not isinstance(msg, ToolMessage):
             return False
         if tool_call_id:
-            return msg.tool_call_id == tool_call_id
+            return bool(msg.tool_call_id == tool_call_id)
         return getattr(msg, "name", None) == tool_name
 
     # 1. Find the checkpoint where the target ToolMessage was first produced.
