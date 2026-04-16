@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import random
 import sys
 from datetime import datetime, timezone
 from typing import Any
@@ -109,6 +110,7 @@ class TracingMixin:
         tags: list[str] | None = None,
         client: Any = None,
         configurable: dict[str, Any] | None = None,
+        trace_id: str | None = None,
     ) -> None:
         self._user_id = user_id
         self._session_id = session_id
@@ -117,6 +119,7 @@ class TracingMixin:
         self._tags = tags
         self._client = client
         self._configurable = configurable
+        self._forced_trace_id = trace_id
 
         # State tracking
         self._runs: dict[str, ObsState] = {}
@@ -156,6 +159,7 @@ class TracingMixin:
         model: str | None = None,
         metadata: dict[str, Any] | None = None,
         model_parameters: dict[str, Any] | None = None,
+        tool_call_id: str | None = None,
     ) -> ObsState:
         """Create an observation by starting an OTel span."""
         rid = str(run_id)
@@ -170,6 +174,20 @@ class TracingMixin:
             parent_obs = self._get_parent_obs(str(parent_run_id))
             if parent_obs and parent_obs.otel_context:
                 parent_ctx = parent_obs.otel_context
+        elif is_root and self._forced_trace_id:
+            # Force the root span onto a specific trace by creating a remote
+            # parent context with the desired trace ID.  The child span
+            # inherits the trace ID but gets its own span ID.
+            hex_id = self._forced_trace_id.replace("-", "")
+            remote_span = otel_trace.NonRecordingSpan(
+                otel_trace.SpanContext(
+                    trace_id=int(hex_id, 16),
+                    span_id=random.getrandbits(64),
+                    is_remote=True,
+                    trace_flags=otel_trace.TraceFlags(otel_trace.TraceFlags.SAMPLED),
+                )
+            )
+            parent_ctx = otel_trace.set_span_in_context(remote_span, parent_ctx)
 
         # Start the OTel span
         span: otel_trace.Span | None = None
@@ -233,19 +251,13 @@ class TracingMixin:
 
             # Capture execution context for tool observations
             if obs_type == "tool":
+                if tool_call_id:
+                    span.set_attribute(attrs.TOOL_CALL_ID, tool_call_id)
                 ctx = capture_context()
                 if self._configurable:
                     ctx["__configurable"] = self._configurable
                 if ctx:
                     merged_metadata = {**(merged_metadata or {}), "__lightrace_context": ctx}
-
-            # Auto-capture checkpoint state for GENERATION observations
-            # The input to a generation IS the full agent state (messages + tools + model)
-            if obs_type == "generation" and input_data is not None:
-                span.set_attribute(
-                    attrs.CHECKPOINT_STATE,
-                    attrs._safe_json(json_serializable(input_data)),
-                )
 
             if merged_metadata:
                 span.set_attribute(attrs.OBSERVATION_METADATA, attrs._safe_json(merged_metadata))

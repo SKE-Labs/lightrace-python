@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import logging
 import os
@@ -10,6 +11,7 @@ from typing import Any
 
 import httpx
 
+from . import trace as _trace_module
 from .dev_server import DevServer
 from .observation import Observation
 from .otel_exporter import LightraceOtelExporter
@@ -31,19 +33,26 @@ logger = logging.getLogger("lightrace")
 class Lightrace:
     """Main Lightrace SDK client.
 
-    Usage:
+    Usage::
+
         lt = Lightrace(
             public_key="pk-lt-demo",
             secret_key="sk-lt-demo",
             host="http://localhost:3000",
+            tools=[get_weather, calculate],
+            context={
+                "user_id": (get_user_id, set_user_id),
+                "thread_id": (get_thread_id, set_thread_id),
+            },
         )
 
-        @trace()
-        def my_function():
-            ...
-
-        lt.flush()
-        lt.shutdown()
+    Args:
+        tools: LangChain ``BaseTool`` objects or plain callables to register
+            for dashboard re-invocation.  Same as calling
+            ``register_tools(*tools)`` after init.
+        context: Dict mapping context variable names to ``(getter, setter)``
+            tuples for automatic capture/restore during fork.  Same as
+            calling ``register_context(name, getter, setter)`` for each.
 
     Docker note:
         When the Lightrace backend runs in Docker, set ``dev_server_host``
@@ -51,7 +60,6 @@ class Lightrace:
         can reach the SDK's dev server for tool re-invocation::
 
             lt = Lightrace(..., dev_server_host="host.docker.internal")
-            # or: LIGHTRACE_DEV_SERVER_HOST=host.docker.internal python app.py
     """
 
     _instance: Lightrace | None = None
@@ -69,6 +77,8 @@ class Lightrace:
         dev_server: bool = True,
         dev_server_port: int = 0,
         dev_server_host: str | None = None,
+        tools: list[Any] | None = None,
+        context: dict[str, tuple[Any, Any]] | None = None,
     ):
         self._public_key = public_key or os.environ.get("LIGHTRACE_PUBLIC_KEY", "")
         self._secret_key = secret_key or os.environ.get("LIGHTRACE_SECRET_KEY", "")
@@ -110,6 +120,17 @@ class Lightrace:
         # Start dev server for tool invocation from the dashboard
         if self._dev_server_enabled:
             self._start_dev_server()
+
+        # Register context variables for automatic capture/restore during fork
+        if context:
+            from .context import register_context as _register_context
+
+            for name, (getter, setter) in context.items():
+                _register_context(name, getter, setter)
+
+        # Register tools for dashboard re-invocation
+        if tools:
+            self.register_tools(*tools)
 
     @classmethod
     def get_instance(cls) -> Lightrace | None:
@@ -177,7 +198,9 @@ class Lightrace:
 
         capabilities: dict[str, Any] | None = None
         if _replay_handler_registry:
-            capabilities = {"replay": True}
+            handler = _replay_handler_registry.get("default")
+            has_graph = handler is not None and hasattr(handler, "aupdate_state")
+            capabilities = {"replay": True, "graph": has_graph}
 
         auth = base64.b64encode(f"{self._public_key}:{self._secret_key}".encode()).decode()
         host = self._host
@@ -276,23 +299,33 @@ class Lightrace:
         if _tool_registry and self._enabled:
             self._register_tools_http()
 
-    def register_replay_handler(self, handler: Any, *, name: str = "default") -> None:
-        """Register a replay handler for fork from the dashboard.
-
-        The handler is an async callable that accepts (messages, tools, model, system)
-        and returns the LLM continuation. This enables framework-agnostic replay.
-        """
-        _replay_handler_registry[name] = handler
-        logger.info("Registered replay handler %r", name)
-        if self._enabled:
-            self._register_tools_http()
-
-    def register_graph(self, graph: Any, *, name: str = "default") -> None:
+    def register_graph(
+        self,
+        graph: Any,
+        *,
+        name: str = "default",
+        event_loop: Any = None,
+    ) -> None:
         """Register a compiled LangGraph for replay/fork from the dashboard.
 
         Convenience method that auto-creates a replay handler from the graph.
+
+        Args:
+            graph: A compiled LangGraph (``CompiledStateGraph``).
+            name: Handler name (default ``"default"``).
+            event_loop: The asyncio event loop where the graph's checkpointer
+                was created.  Required when the checkpointer uses async
+                primitives (e.g. ``AsyncPostgresSaver``).  Pass
+                ``asyncio.get_running_loop()`` from the application startup.
         """
         _replay_handler_registry[name] = graph
+        if event_loop is not None:
+            _trace_module._replay_main_loop = event_loop
+        else:
+            try:
+                _trace_module._replay_main_loop = asyncio.get_running_loop()
+            except RuntimeError:
+                _trace_module._replay_main_loop = None
         logger.info("Registered graph %r for replay", name)
         if self._enabled:
             self._register_tools_http()

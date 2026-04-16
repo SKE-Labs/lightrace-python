@@ -406,3 +406,23 @@ async def traced_query(
     async for message in query(prompt=prompt, options=options, transport=transport):
         handler.handle(message)
         yield message
+
+
+# TODO: Fork support for Claude Agent SDK
+#
+# The Claude Agent SDK uses a streaming message-based execution model,
+# not LangGraph-style checkpoints. Fork implementation would need to:
+# 1. Capture agent state at each tool call (messages so far, tools, model)
+# 2. Re-invoke the agent from that point with a modified tool result
+# 3. Stream OTel observations to the forked trace
+#
+# async def fork_agent(
+#     agent: Any,
+#     thread_id: str,
+#     tool_call_id: str | None,
+#     tool_name: str,
+#     modified_content: str,
+#     context: dict[str, Any] | None,
+#     forked_trace_id: str | None = None,
+# ) -> None:
+#     raise NotImplementedError("Claude Agent SDK fork support not yet implemented")

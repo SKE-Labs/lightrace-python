@@ -40,7 +40,7 @@ OBSERVATION_COST_DETAILS = "lightrace.observation.cost_details"
 
 GRAPH_THREAD_ID = "lightrace.graph.thread_id"
 GRAPH_CHECKPOINT_ID = "lightrace.graph.checkpoint_id"
-CHECKPOINT_STATE = "lightrace.checkpoint.state"
+TOOL_CALL_ID = "lightrace.tool.call_id"
 
 RELEASE = "lightrace.release"
 VERSION = "lightrace.version"

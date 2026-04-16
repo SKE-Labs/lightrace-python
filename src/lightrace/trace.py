@@ -29,6 +29,7 @@ _current_observation_id: ContextVar[str | None] = ContextVar(
 _otel_exporter: Any = None  # LightraceOtelExporter instance
 _tool_registry: dict[str, dict[str, Any]] = {}
 _replay_handler_registry: dict[str, Any] = {}
+_replay_main_loop: Any = None  # event loop where the graph's checkpointer was created
 _on_tool_registered: Callable[[str], None] | None = None
 
 # Client defaults
@@ -51,6 +52,10 @@ def _get_tool_registry() -> dict[str, dict[str, Any]]:
 
 def _get_replay_handler_registry() -> dict[str, Any]:
     return _replay_handler_registry
+
+
+def _get_replay_main_loop() -> Any:
+    return _replay_main_loop
 
 
 def _set_on_tool_registered(callback: Callable[[str], None] | None) -> None:

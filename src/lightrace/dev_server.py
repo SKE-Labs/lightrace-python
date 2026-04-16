@@ -24,7 +24,7 @@ from starlette.requests import Request as StarletteRequest
 from starlette.responses import Response as StarletteResponse
 
 from .context import capture_context, restore_context
-from .trace import _get_replay_handler_registry, _get_tool_registry
+from .trace import _get_replay_handler_registry, _get_replay_main_loop, _get_tool_registry
 from .utils import json_serializable
 
 logger = logging.getLogger("lightrace")
@@ -51,11 +51,12 @@ class InvokeRequest(BaseModel):
 
 
 class ReplayRequest(BaseModel):
-    messages: list[dict[str, Any]]
-    tools: list[dict[str, Any]] | None = None
-    model: str | None = None
-    system: str | list[dict[str, Any]] | None = None
+    thread_id: str
+    tool_call_id: str | None = None
+    tool_name: str
+    modified_content: str
     context: dict[str, Any] | None = None
+    forked_trace_id: str | None = None
 
 
 def _api_response(code: int, message: str, response: Any = None) -> JSONResponse:
@@ -63,6 +64,73 @@ def _api_response(code: int, message: str, response: Any = None) -> JSONResponse
         status_code=code,
         content={"code": code, "message": message, "response": response},
     )
+
+
+async def _dispatch_func(func: Any, input_data: Any) -> Any:
+    """Call a tool function with smart kwarg spreading. Returns raw result."""
+    spread = False
+    if isinstance(input_data, dict):
+        try:
+            sig = inspect.signature(func)
+            param_names = {
+                p.name
+                for p in sig.parameters.values()
+                if p.kind not in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD)
+            }
+            spread = len(param_names) > 0 and set(input_data.keys()).issubset(param_names)
+        except (ValueError, TypeError):
+            spread = False
+
+    if asyncio.iscoroutinefunction(func):
+        if spread:
+            return await func(**input_data)
+        elif input_data is not None:
+            return await func(input_data)
+        else:
+            return await func()
+    else:
+        if spread:
+            return await asyncio.to_thread(func, **input_data)
+        elif input_data is not None:
+            return await asyncio.to_thread(func, input_data)
+        else:
+            return await asyncio.to_thread(func)
+
+
+async def _invoke_tool(registry: dict[str, Any], tool_name: str, tool_input: Any) -> Any:
+    """Invoke a registered tool by name. Returns serializable output or error string."""
+    tool_info = registry.get(tool_name)
+    if not tool_info:
+        return f"Tool '{tool_name}' not registered in SDK"
+    try:
+        result = await _dispatch_func(tool_info["func"], tool_input)
+        return json_serializable(result)
+    except Exception as e:
+        return f"Error invoking {tool_name}: {e}"
+
+
+def _resolve_fork_fn(handler: Any) -> Any | None:
+    """Detect the framework of a registered handler and return its fork function.
+
+    Returns ``None`` if the handler type is not recognised.
+    """
+    # LangChain / LangGraph — compiled graph with checkpoint support
+    if hasattr(handler, "ainvoke") and hasattr(handler, "aupdate_state"):
+        from .integrations.langchain import fork_graph
+
+        return fork_graph
+
+    # TODO: CrewAI fork support
+    # if hasattr(handler, "kickoff"):
+    #     from .integrations.crewai import fork_crew
+    #     return fork_crew
+
+    # TODO: Claude Agent SDK fork support
+    # if hasattr(handler, "run") and hasattr(handler, "tools"):
+    #     from .integrations.claude_agent_sdk import fork_agent
+    #     return fork_agent
+
+    return None
 
 
 def _create_app(public_key: str) -> FastAPI:
@@ -92,48 +160,14 @@ def _create_app(public_key: str) -> FastAPI:
         if not tool_info:
             return _api_response(404, f"Tool not found: {req.tool}")
 
-        func = tool_info["func"]
-        input_data = req.input
         start = time.monotonic()
 
-        # Restore captured context variables (e.g., user_id, thread_id)
-        # Save old values so we can reset after invocation to prevent leaks
         saved_context = capture_context() if req.context else None
         if req.context:
             restore_context(req.context)
 
-        # Smart dispatch: spread kwargs when input keys match function parameter names
-        spread = False
-        if isinstance(input_data, dict):
-            try:
-                sig = inspect.signature(func)
-                param_names = {
-                    p.name
-                    for p in sig.parameters.values()
-                    if p.kind
-                    not in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD)
-                }
-                # Spread if the input dict keys are a subset of the function's param names
-                spread = len(param_names) > 0 and set(input_data.keys()).issubset(param_names)
-            except (ValueError, TypeError):
-                spread = False
-
         try:
-            if asyncio.iscoroutinefunction(func):
-                if spread:
-                    result = await func(**input_data)
-                elif input_data is not None:
-                    result = await func(input_data)
-                else:
-                    result = await func()
-            else:
-                if spread:
-                    result = await asyncio.to_thread(func, **input_data)
-                elif input_data is not None:
-                    result = await asyncio.to_thread(func, input_data)
-                else:
-                    result = await asyncio.to_thread(func)
-
+            result = await _dispatch_func(tool_info["func"], req.input)
             duration_ms = round((time.monotonic() - start) * 1000)
             return _api_response(
                 200,
@@ -170,77 +204,56 @@ def _create_app(public_key: str) -> FastAPI:
         if handler is None:
             return _api_response(
                 400,
-                "No replay handler registered. "
-                "Call lt.register_replay_handler(fn) or lt.register_graph(agent).",
+                "No graph registered for replay. Call register_graph() to enable fork/replay.",
             )
 
-        saved_context = capture_context() if req.context else None
-        if req.context:
-            restore_context(req.context)
-
-        start = time.monotonic()
-        try:
-            # Check if handler is a LangGraph compiled graph (has ainvoke/astream)
-            if hasattr(handler, "ainvoke") and hasattr(handler, "astream"):
-                # LangGraph path: invoke the graph with the modified messages
-                from langchain_core.messages import (
-                    AIMessage,
-                    HumanMessage,
-                    SystemMessage,
-                    ToolMessage,
-                )
-
-                def _to_langchain_msg(m: dict[str, Any]) -> Any:
-                    role = m.get("role", "")
-                    content = m.get("content", "")
-                    if role == "user":
-                        return HumanMessage(content=content)
-                    elif role == "assistant":
-                        return AIMessage(
-                            content=content,
-                            tool_calls=m.get("tool_calls", []),
-                        )
-                    elif role == "tool":
-                        return ToolMessage(
-                            content=content,
-                            tool_call_id=m.get("tool_call_id", ""),
-                            name=m.get("name", ""),
-                        )
-                    elif role == "system":
-                        return SystemMessage(content=content)
-                    logger.warning("Unknown message role %r — treating as user", role)
-                    return HumanMessage(content=content)
-
-                lc_messages = [_to_langchain_msg(m) for m in req.messages]
-                result = await handler.ainvoke({"messages": lc_messages})
-                output = json_serializable(result)
-            elif asyncio.iscoroutinefunction(handler):
-                # Generic async handler
-                output = await handler(req.messages, req.tools, req.model, req.system)
-                output = json_serializable(output)
-            else:
-                # Generic sync handler
-                output = await asyncio.to_thread(
-                    handler, req.messages, req.tools, req.model, req.system
-                )
-                output = json_serializable(output)
-
-            duration_ms = round((time.monotonic() - start) * 1000)
+        # Detect framework and resolve the fork function.
+        # Each framework provides its own fork implementation in its
+        # integration module.
+        fork_fn = _resolve_fork_fn(handler)
+        if fork_fn is None:
             return _api_response(
-                200,
-                "OK",
-                {"output": output, "durationMs": duration_ms},
+                400,
+                "Registered handler is not a supported graph type. "
+                "Currently supported: LangChain/LangGraph.",
             )
-        except Exception as e:
-            duration_ms = round((time.monotonic() - start) * 1000)
+
+        main_loop = _get_replay_main_loop()
+        if main_loop is None or not main_loop.is_running():
             return _api_response(
-                200,
-                "OK",
-                {"output": None, "error": str(e), "durationMs": duration_ms},
+                500,
+                "No event loop available for replay. "
+                "Call register_graph() with event_loop from an async context.",
             )
-        finally:
-            if saved_context is not None:
-                restore_context(saved_context)
+
+        # Context (user_id, thread_id, etc.) MUST be restored inside
+        # the coroutine that runs on the main event loop, not here on
+        # the dev server thread — ContextVars don't cross threads.
+        replay_context = req.context
+        forked_trace_id = req.forked_trace_id
+
+        async def _do_replay() -> None:
+            try:
+                if replay_context:
+                    restore_context(replay_context)
+                await fork_fn(
+                    graph=handler,
+                    thread_id=req.thread_id,
+                    tool_call_id=req.tool_call_id,
+                    tool_name=req.tool_name,
+                    modified_content=req.modified_content,
+                    context=replay_context,
+                    forked_trace_id=forked_trace_id,
+                )
+                logger.info("Fork replay completed for trace %s", forked_trace_id)
+            except Exception:
+                logger.exception("Fork replay failed for trace %s", forked_trace_id)
+
+        # Fire-and-forget: dispatch to the main event loop and return
+        # immediately so the dashboard can navigate to the compare view.
+        asyncio.run_coroutine_threadsafe(_do_replay(), main_loop)
+
+        return _api_response(200, "OK", {"status": "started"})
 
     return app
 

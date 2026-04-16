@@ -1,8 +1,12 @@
-"""Tests for the /replay endpoint and replay handler registration."""
+"""Tests for the /replay endpoint (LangGraph-native fork)."""
 
+import asyncio
 import json
+import sys
+import threading
 import urllib.error
 import urllib.request
+from unittest.mock import AsyncMock, MagicMock
 
 from lightrace.dev_server import DevServer
 from lightrace.trace import _replay_handler_registry, _tool_registry
@@ -23,6 +27,73 @@ def _request(port, path, method="GET", body=None, headers=None):
         return e.code, json.loads(e.read())
 
 
+def _make_mock_graph(replay_output=None, replay_error=None):
+    """Create a mock LangGraph compiled graph with ainvoke/astream/aupdate_state.
+
+    The mock walks ``aget_state_history`` returning one checkpoint with a
+    ToolMessage, then ``aupdate_state`` records the call, and ``ainvoke``
+    returns the configured output.
+    """
+    from langchain_core.messages import ToolMessage
+
+    graph = MagicMock()
+
+    # Ensure LangGraph detection: handler has ainvoke + astream
+    graph.ainvoke = AsyncMock()
+    graph.astream = AsyncMock()
+    graph.aupdate_state = AsyncMock()
+    graph.nodes = {"agent": True, "tools": True}
+
+    # Build a fake state history with one checkpoint containing a real ToolMessage
+    fake_tool_msg = ToolMessage(
+        content="original result",
+        tool_call_id="call_abc123",
+        name="search",
+        id="msg-tool-1",
+    )
+
+    fake_state = MagicMock()
+    fake_state.values = {"messages": [fake_tool_msg]}
+    fake_state.config = {
+        "configurable": {
+            "thread_id": "thread-1",
+            "checkpoint_id": "cp-original",
+            "user_id": "user-123",
+        }
+    }
+
+    async def _fake_state_history(config):
+        yield fake_state
+
+    graph.aget_state_history = _fake_state_history
+
+    if replay_error:
+        graph.ainvoke.side_effect = replay_error
+    else:
+        graph.ainvoke.return_value = replay_output or {"messages": []}
+
+    return graph
+
+
+def _replay_body(
+    thread_id="thread-1",
+    tool_name="search",
+    modified_content="new result",
+    tool_call_id=None,
+    context=None,
+):
+    body = {
+        "thread_id": thread_id,
+        "tool_name": tool_name,
+        "modified_content": modified_content,
+    }
+    if tool_call_id:
+        body["tool_call_id"] = tool_call_id
+    if context:
+        body["context"] = context
+    return body
+
+
 class TestReplayEndpoint:
     """Tests share a single DevServer instance started once for the class."""
 
@@ -33,10 +104,23 @@ class TestReplayEndpoint:
     def setup_class(cls):
         cls.server = DevServer()
         cls.port = cls.server.start()
+        # Start a background event loop so fire-and-forget replay can dispatch.
+        # Set the module global directly via sys.modules to avoid import aliasing.
+        cls._loop = asyncio.new_event_loop()
+        cls._loop_thread = threading.Thread(
+            target=cls._loop.run_forever,
+            daemon=True,
+            name="test-replay-loop",
+        )
+        cls._loop_thread.start()
+        sys.modules["lightrace.trace"]._replay_main_loop = cls._loop
 
     @classmethod
     def teardown_class(cls):
         cls.server.stop()
+        cls._loop.call_soon_threadsafe(cls._loop.stop)
+        cls._loop_thread.join(timeout=2)
+        sys.modules["lightrace.trace"]._replay_main_loop = None
 
     def setup_method(self):
         _tool_registry.clear()
@@ -50,82 +134,27 @@ class TestReplayEndpoint:
         return _request(self.port, "/replay", method="POST", body=body, headers=headers)
 
     def test_replay_with_no_handler_returns_400(self):
-        status, body = self._post_replay(
-            {"messages": [{"role": "user", "content": "hi"}]},
-        )
+        status, body = self._post_replay(_replay_body())
         assert status == 400
         assert body["code"] == 400
-        assert "No replay handler registered" in body["message"]
+        assert "No graph registered" in body["message"]
 
-    def test_replay_with_sync_handler(self):
-        def my_handler(messages, tools, model, system):
-            return {"response": f"Got {len(messages)} messages, model={model}"}
+    def test_replay_with_non_graph_handler_returns_400(self):
+        """A plain callable (not a LangGraph) should be rejected."""
+        _replay_handler_registry["default"] = lambda: None
+        status, body = self._post_replay(_replay_body())
+        assert status == 400
+        assert "not a supported graph type" in body["message"]
 
-        _replay_handler_registry["default"] = my_handler
-
-        status, body = self._post_replay(
-            {"messages": [{"role": "user", "content": "hello"}], "model": "gpt-4"},
-        )
-        assert status == 200
-        assert body["code"] == 200
-        resp = body["response"]
-        assert resp["output"]["response"] == "Got 1 messages, model=gpt-4"
-        assert resp["durationMs"] >= 0
-        assert "error" not in resp
-
-    def test_replay_with_async_handler(self):
-        async def my_async_handler(messages, tools, model, system):
-            return {"messages_count": len(messages)}
-
-        _replay_handler_registry["default"] = my_async_handler
-
-        status, body = self._post_replay(
-            {"messages": [{"role": "user", "content": "hi"}]},
-        )
-        assert status == 200
-        assert body["response"]["output"]["messages_count"] == 1
-
-    def test_replay_handler_error(self):
-        def broken_handler(messages, tools, model, system):
-            raise RuntimeError("replay broke")
-
-        _replay_handler_registry["default"] = broken_handler
-
-        status, body = self._post_replay({"messages": []})
-        assert status == 200
-        assert body["response"]["output"] is None
-        assert body["response"]["error"] == "replay broke"
-
-    def test_replay_with_all_fields(self):
-        def handler(messages, tools, model, system):
-            return {
-                "messages": len(messages),
-                "tools": len(tools) if tools else 0,
-                "model": model,
-                "has_system": system is not None,
-            }
-
-        _replay_handler_registry["default"] = handler
-
-        status, body = self._post_replay(
-            {
-                "messages": [{"role": "user", "content": "hi"}],
-                "tools": [{"name": "search"}],
-                "model": "claude-3",
-                "system": "You are helpful",
-            }
-        )
-        assert status == 200
-        output = body["response"]["output"]
-        assert output["messages"] == 1
-        assert output["tools"] == 1
-        assert output["model"] == "claude-3"
-        assert output["has_system"] is True
+    def test_replay_validation_error(self):
+        """Missing required fields should return 422."""
+        status, _body = self._post_replay({"thread_id": "t1"})
+        assert status == 422
 
     def test_replay_auth_rejection(self):
-        _replay_handler_registry["default"] = lambda m, t, mo, s: {}
+        graph = _make_mock_graph()
+        _replay_handler_registry["default"] = graph
 
-        # Need a separate server with auth for this test
         auth_server = DevServer(public_key="pk-secret")
         try:
             auth_port = auth_server.start()
@@ -133,7 +162,7 @@ class TestReplayEndpoint:
                 auth_port,
                 "/replay",
                 method="POST",
-                body={"messages": []},
+                body=_replay_body(),
                 headers={"Authorization": "Bearer wrong"},
             )
             assert status == 401
@@ -141,7 +170,8 @@ class TestReplayEndpoint:
             auth_server.stop()
 
     def test_replay_auth_accepted(self):
-        _replay_handler_registry["default"] = lambda m, t, mo, s: {"ok": True}
+        graph = _make_mock_graph(replay_output={"messages": []})
+        _replay_handler_registry["default"] = graph
 
         auth_server = DevServer(public_key="pk-secret")
         try:
@@ -150,10 +180,29 @@ class TestReplayEndpoint:
                 auth_port,
                 "/replay",
                 method="POST",
-                body={"messages": []},
+                body=_replay_body(),
                 headers={"Authorization": "Bearer pk-secret"},
             )
             assert status == 200
-            assert body["response"]["output"]["ok"] is True
+            assert body["code"] == 200
+            assert body["response"]["status"] == "started"
         finally:
             auth_server.stop()
+
+    def test_replay_graph_error_is_fire_and_forget(self):
+        """Even when the graph will fail, the endpoint returns 200 immediately."""
+        graph = _make_mock_graph(replay_error=RuntimeError("graph broke"))
+        _replay_handler_registry["default"] = graph
+
+        status, body = self._post_replay(_replay_body())
+        assert status == 200
+        assert body["response"]["status"] == "started"
+
+    def test_replay_with_context(self):
+        """Context should be accepted without validation errors."""
+        graph = _make_mock_graph(replay_output={"messages": []})
+        _replay_handler_registry["default"] = graph
+
+        status, body = self._post_replay(_replay_body(context={"user_id": "u1", "spawn_id": "s1"}))
+        assert status == 200
+        assert body["code"] == 200

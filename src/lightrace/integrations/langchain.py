@@ -37,6 +37,7 @@ class LightraceCallbackHandler(TracingMixin, BaseCallbackHandler):
         tags: list[str] | None = None,
         client: Any = None,
         configurable: dict[str, Any] | None = None,
+        trace_id: str | None = None,
     ) -> None:
         TracingMixin.__init__(
             self,
@@ -47,6 +48,7 @@ class LightraceCallbackHandler(TracingMixin, BaseCallbackHandler):
             tags=tags,
             client=client,
             configurable=configurable,
+            trace_id=trace_id,
         )
         BaseCallbackHandler.__init__(self)
 
@@ -90,16 +92,23 @@ class LightraceCallbackHandler(TracingMixin, BaseCallbackHandler):
 
     @staticmethod
     def _convert_messages(messages: Sequence[Any]) -> list[list[dict[str, Any]]]:
-        """Convert LangChain message lists to plain dicts."""
+        """Convert LangChain message lists to plain dicts.
+
+        Uses model_dump() to preserve all fields (tool_call_id, name, id,
+        status, additional_kwargs, etc.) needed for replay and provider
+        format conversion. Normalizes ``type`` → ``role`` for consistency.
+        """
         result: list[list[dict[str, Any]]] = []
         for message_list in messages:
             converted: list[dict[str, Any]] = []
             for msg in message_list:
-                if hasattr(msg, "type") and hasattr(msg, "content"):
-                    entry: dict[str, Any] = {"role": msg.type, "content": msg.content}
-                    if hasattr(msg, "tool_calls") and msg.tool_calls:
-                        entry["tool_calls"] = msg.tool_calls
+                if hasattr(msg, "model_dump"):
+                    entry = msg.model_dump(exclude_none=True, exclude_defaults=True)
+                    # Normalize type → role for downstream converters
+                    entry["role"] = entry.pop("type", getattr(msg, "type", "unknown"))
                     converted.append(entry)
+                elif hasattr(msg, "type") and hasattr(msg, "content"):
+                    converted.append({"role": msg.type, "content": msg.content})
                 elif isinstance(msg, dict):
                     converted.append(msg)
                 else:
@@ -140,11 +149,12 @@ class LightraceCallbackHandler(TracingMixin, BaseCallbackHandler):
             return {k: self._normalize_io(v) for k, v in data.items()}
         if isinstance(data, list):
             return [self._normalize_io(item) for item in data]
+        if hasattr(data, "model_dump"):
+            entry = data.model_dump(exclude_none=True, exclude_defaults=True)
+            entry["role"] = entry.pop("type", getattr(data, "type", "unknown"))
+            return entry
         if hasattr(data, "type") and hasattr(data, "content"):
-            result: dict[str, Any] = {"role": data.type, "content": data.content}
-            if hasattr(data, "tool_calls") and data.tool_calls:
-                result["tool_calls"] = data.tool_calls
-            return result
+            return {"role": data.type, "content": data.content}
         return data
 
     # ── Chain callbacks ──────────────────────────────────────────────
@@ -397,6 +407,7 @@ class LightraceCallbackHandler(TracingMixin, BaseCallbackHandler):
         try:
             serialized = serialized or {}
             resolved_name = name or serialized.get("name", "tool")
+            tool_call_id = kwargs.get("tool_call_id")
             self._create_obs(
                 run_id=str(run_id),
                 parent_run_id=str(parent_run_id) if parent_run_id else None,
@@ -404,6 +415,7 @@ class LightraceCallbackHandler(TracingMixin, BaseCallbackHandler):
                 name=resolved_name,
                 input_data=input_str,
                 metadata=metadata,
+                tool_call_id=str(tool_call_id) if tool_call_id else None,
             )
         except Exception:
             logger.exception("Error in on_tool_start")
@@ -488,3 +500,117 @@ class LightraceCallbackHandler(TracingMixin, BaseCallbackHandler):
             self._end_obs(str(run_id), level="ERROR", status_message=str(error))
         except Exception:
             logger.exception("Error in on_retriever_error")
+
+
+# ── LangGraph fork / replay ─────────────────────────────────────────
+
+
+async def fork_graph(
+    graph: Any,
+    thread_id: str,
+    tool_call_id: str | None,
+    tool_name: str,
+    modified_content: str,
+    context: dict[str, Any] | None,
+    forked_trace_id: str | None = None,
+) -> None:
+    """Fork a LangGraph thread at a tool result and continue execution.
+
+    Uses the graph's own checkpointer to walk state history, find the
+    post-tools checkpoint, replace the ToolMessage, and resume via
+    ``ainvoke``.  When ``forked_trace_id`` is set, a
+    :class:`LightraceCallbackHandler` streams OTel observations to the
+    forked trace in real-time.
+
+    This is the LangChain/LangGraph implementation of the fork feature.
+    Other frameworks (CrewAI, Claude Agent SDK) will have their own
+    implementations in their respective integration modules.
+    """
+    from langchain_core.messages import ToolMessage
+
+    config: dict[str, Any] = {"configurable": {"thread_id": thread_id}}
+
+    def _matches(msg: Any) -> bool:
+        if not isinstance(msg, ToolMessage):
+            return False
+        if tool_call_id:
+            return msg.tool_call_id == tool_call_id
+        return getattr(msg, "name", None) == tool_name
+
+    # 1. Find the checkpoint where the target ToolMessage was first produced.
+    #    State history is newest→oldest. We want the OLDEST checkpoint that
+    #    still contains the ToolMessage (= the post-tools checkpoint).
+    target_state = None
+    target_tool_msg = None
+
+    async for state in graph.aget_state_history(config):
+        messages = state.values.get("messages", [])
+        found = next((m for m in messages if _matches(m)), None)
+        if found:
+            target_state = state
+            target_tool_msg = found
+        elif target_state is not None:
+            break  # Crossed the boundary — target_state is the post-tools checkpoint
+
+    if target_state is None or target_tool_msg is None:
+        raise ValueError(f"No checkpoint found with tool '{tool_name}' in thread '{thread_id}'")
+
+    logger.info(
+        "Fork: matched post-tools checkpoint with %d messages, next=%s",
+        len(target_state.values.get("messages", [])),
+        target_state.next,
+    )
+
+    # 2. Replace the ToolMessage — same message ID triggers replacement
+    #    via the add_messages reducer.
+    replacement = ToolMessage(
+        content=modified_content,
+        tool_call_id=target_tool_msg.tool_call_id,
+        name=tool_name,
+        id=target_tool_msg.id,
+    )
+
+    # 3. Fork from the target checkpoint using the ORIGINAL config.
+    fork_config = await graph.aupdate_state(
+        target_state.config,
+        {"messages": [replacement]},
+    )
+
+    # 4. Merge app-level configurable keys (user_id, spawn_id, etc.)
+    original_configurable = target_state.config.get("configurable", {})
+    for k, v in original_configurable.items():
+        if k not in ("thread_id", "checkpoint_id", "checkpoint_ns"):
+            fork_config["configurable"].setdefault(k, v)
+    if context:
+        for k in ("user_id", "spawn_id"):
+            if k in context:
+                fork_config["configurable"][k] = context[k]
+
+    # 5. Attach a LightraceCallbackHandler so the continuation produces
+    #    real OTel observations on the forked trace (full trace tree).
+    callbacks: list[Any] = []
+    if forked_trace_id:
+        try:
+            from ..client import Lightrace
+
+            client = Lightrace.get_instance()
+            if client:
+                callbacks.append(
+                    LightraceCallbackHandler(
+                        client=client,
+                        trace_id=forked_trace_id,
+                        trace_name=f"{tool_name} (fork)",
+                        user_id=context.get("user_id") if context else None,
+                        session_id=thread_id,
+                        configurable=fork_config.get("configurable"),
+                    )
+                )
+        except Exception:
+            logger.warning("Could not create fork callback handler", exc_info=True)
+
+    invoke_config = fork_config
+    if callbacks:
+        invoke_config = {**fork_config, "callbacks": callbacks}
+
+    # 6. Continue execution from the fork point.
+    await graph.ainvoke(None, invoke_config)

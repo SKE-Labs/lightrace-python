@@ -81,6 +81,28 @@ lt.shutdown()
 | `model`    | `str`  | `None`  | For `type="generation"`: LLM model name                  |
 | `metadata` | `dict` | `None`  | Static metadata attached to every call                   |
 
+## `Lightrace()` Constructor
+
+| Parameter  | Type                            | Default | Description                                                          |
+| ---------- | ------------------------------- | ------- | -------------------------------------------------------------------- |
+| `tools`    | `list`                          | `None`  | LangChain tools or callables to register for dashboard re-invocation |
+| `context`  | `dict[str, (getter, setter)]`   | `None`  | Context variables for automatic capture/restore during fork          |
+
+```python
+from lightrace import Lightrace
+
+lt = Lightrace(
+    public_key="pk-lt-demo",
+    secret_key="sk-lt-demo",
+    host="http://localhost:3000",
+    tools=[get_weather, calculate],           # register tools in one step
+    context={                                  # register context vars in one step
+        "user_id": (get_user_id, set_user_id),
+        "session_id": (get_session, set_session),
+    },
+)
+```
+
 ## Integrations
 
 ### OpenAI
@@ -170,6 +192,68 @@ response = model.invoke(
 lt.flush()
 lt.shutdown()
 ```
+
+### LangGraph Fork / Replay
+
+Fork lets you answer "what if this tool returned something different?" by
+forking a LangGraph execution from any tool checkpoint and continuing with
+modified output.
+
+```python
+import asyncio
+from langchain_anthropic import ChatAnthropic
+from langchain_core.tools import tool
+from langgraph.checkpoint.memory import MemorySaver
+from langgraph.prebuilt import create_react_agent
+from lightrace import Lightrace
+from lightrace.integrations.langchain import LightraceCallbackHandler
+
+@tool
+def get_weather(city: str) -> str:
+    """Get the current weather for a city."""
+    return "72F, sunny"
+
+# Pass tools= to register them for dashboard re-invocation
+lt = Lightrace(
+    public_key="pk-lt-demo",
+    secret_key="sk-lt-demo",
+    host="http://localhost:3000",
+    tools=[get_weather],
+)
+
+# Checkpointer is required for fork
+agent = create_react_agent(
+    ChatAnthropic(model="claude-sonnet-4-20250514"),
+    [get_weather],
+    checkpointer=MemorySaver(),
+)
+
+async def main():
+    thread_id = "demo-thread"
+    handler = LightraceCallbackHandler(
+        client=lt,
+        session_id=thread_id,
+        trace_name="weather-agent",
+        configurable={"thread_id": thread_id},
+    )
+
+    await agent.ainvoke(
+        {"messages": [("user", "What's the weather in Tokyo?")]},
+        config={"configurable": {"thread_id": thread_id}, "callbacks": [handler]},
+    )
+
+    # Register the graph for fork/replay from the dashboard
+    lt.register_graph(agent, event_loop=asyncio.get_running_loop())
+    lt.flush()
+
+asyncio.run(main())
+```
+
+**Requirements for fork:**
+- Graph must have a **checkpointer** (`MemorySaver`, `AsyncPostgresSaver`, etc.)
+- Call `lt.register_graph(agent)` to enable fork from the dashboard
+- Pass `tools=[...]` to the constructor (or call `lt.register_tools(...)`) so tools can be re-invoked
+- Pass `session_id=thread_id` and `configurable={"thread_id": ...}` to the callback handler
 
 ### Claude Agent SDK
 

@@ -266,3 +266,23 @@ class LightraceCrewAIInstrumentor(TracingMixin):
             self._patched = False
         except ImportError:
             pass
+
+
+# TODO: Fork support for CrewAI
+#
+# CrewAI uses a task-based execution pipeline, not LangGraph-style checkpoints.
+# Fork implementation would need to:
+# 1. Capture task execution state (agent, task, tool invocations)
+# 2. Re-invoke from a specific task with a modified tool result
+# 3. Stream OTel observations to the forked trace
+#
+# async def fork_crew(
+#     crew: Any,
+#     thread_id: str,
+#     tool_call_id: str | None,
+#     tool_name: str,
+#     modified_content: str,
+#     context: dict[str, Any] | None,
+#     forked_trace_id: str | None = None,
+# ) -> None:
+#     raise NotImplementedError("CrewAI fork support not yet implemented")
